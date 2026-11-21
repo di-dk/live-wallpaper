@@ -1,0 +1,831 @@
+#!/usr/bin/env python3
+"""Small GTK4 front-end for mpvpaper (animated video wallpapers).
+
+Shows a thumbnail gallery of video wallpapers found in Steam Workshop
+folders (any folder containing project.json plus a video file), with
+per-wallpaper fit, scale, offset and flip controls applied live.
+
+Run with no arguments to open the window.
+Run with --apply to start the saved wallpaper without a window (used at login).
+"""
+import hashlib
+import json
+import math
+import os
+import re
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+CONFIG_DIR = os.path.expanduser("~/.config/wallpaper-gui")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+THUMB_DIR = os.path.expanduser("~/.cache/wallpaper-gui/thumbs")
+AUTOSTART_FILE = os.path.expanduser("~/.config/autostart/wallpaper-gui.desktop")
+MPVPAPER = os.path.expanduser("~/.local/bin/mpvpaper")
+SELF = os.path.abspath(__file__)
+SOCKET = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "wallpaper-gui-mpv.sock")
+# linux-wallpaperengine renders "scene" and "web" wallpapers; mpvpaper plays videos.
+ENGINE_DIR = os.path.expanduser("~/.local/src/lwpe/build/output")
+ENGINE_BIN = os.path.join(ENGINE_DIR, "linux-wallpaperengine")
+ENGINE_PID = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "wallpaper-gui-engine.pid")
+ENGINE_PATTERN = r"^\S*linux-wallpaperengine "
+KINDS = ["all", "video", "scene", "web"]
+KIND_LABELS = ["All types", "Video", "Scene", "Web"]
+DEFAULT_LIBRARY = os.path.expanduser("~/.steam/steam/steamapps/workshop/content")
+VIDEO_EXT = (".mp4", ".webm", ".mkv", ".mov", ".avi", ".m4v")
+IMAGE_EXT = (".gif", ".jpg", ".jpeg", ".png", ".webp")
+THUMB_W, THUMB_H = 256, 144          # 16:9 cell; other shapes are letterboxed inside it
+MAX_DEPTH = 4
+FITS = ["fill", "fit", "stretch"]
+FIT_LABELS = ["Fill (crop to cover)", "Fit (show whole video)", "Stretch"]
+
+DEFAULTS = {"video": "", "monitor": "", "mute": True, "loop": True,
+            "autostart": False, "folders": None, "tweaks": {}}
+TWEAK_DEFAULTS = {"fit": "fill", "scale": 100, "x": 0, "y": 0, "fliph": False, "flipv": False}
+
+
+# ---- config ---------------------------------------------------------------
+def load_config():
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = {**DEFAULTS, **json.load(f)}
+    except (OSError, ValueError):
+        cfg = dict(DEFAULTS)
+    if cfg["folders"] is None:
+        cfg["folders"] = [DEFAULT_LIBRARY] if os.path.isdir(DEFAULT_LIBRARY) else []
+    if not isinstance(cfg["tweaks"], dict):
+        cfg["tweaks"] = {}
+    return cfg
+
+
+def save_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def get_tweaks(cfg, video):
+    t = cfg["tweaks"].get(video)
+    return {**TWEAK_DEFAULTS, **t} if isinstance(t, dict) else dict(TWEAK_DEFAULTS)
+
+
+# ---- library --------------------------------------------------------------
+def scan_folders(folders):
+    """Find wallpapers: folders holding project.json.
+
+    Each item has a "kind" (video, scene or web) and a "key": the video file
+    for videos, the project folder for scene and web wallpapers.
+    """
+    items, seen = [], set()
+    for root in folders:
+        root = os.path.realpath(root)
+        for d, subdirs, files in os.walk(root):
+            if os.path.relpath(d, root).count(os.sep) >= MAX_DEPTH:
+                subdirs[:] = []
+            if "project.json" not in files:
+                continue
+            subdirs[:] = []
+            try:
+                with open(os.path.join(d, "project.json"), encoding="utf-8", errors="replace") as f:
+                    meta = json.load(f)
+            except (OSError, ValueError):
+                meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            kind = str(meta.get("type", "")).strip().lower()
+            video = None
+            name = meta.get("file")
+            if isinstance(name, str) and name.lower().endswith(VIDEO_EXT) \
+                    and os.path.isfile(os.path.join(d, name)):
+                video = os.path.join(d, name)
+            elif kind not in ("scene", "web"):
+                for name in sorted(files):
+                    if name.lower().endswith(VIDEO_EXT):
+                        video = os.path.join(d, name)
+                        break
+            if video:
+                kind, key = "video", video
+            elif kind in ("scene", "web"):
+                key = d
+            else:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            preview = None
+            name = meta.get("preview")
+            if isinstance(name, str) and os.path.isfile(os.path.join(d, name)):
+                preview = os.path.join(d, name)
+            else:
+                for name in sorted(files):
+                    if name.lower().startswith("preview") and name.lower().endswith(IMAGE_EXT):
+                        preview = os.path.join(d, name)
+                        break
+            title = meta.get("title")
+            if not isinstance(title, str) or not title.strip():
+                title = os.path.basename(d)
+            items.append({"title": title.strip(), "kind": kind, "key": key,
+                          "video": video, "preview": preview})
+    items.sort(key=lambda i: i["title"].lower())
+    return items
+
+
+def library_signature(folders):
+    """Cheap fingerprint of the library folders; changes when items are added or removed."""
+    sig = []
+    for root in folders:
+        try:
+            for name in sorted(os.listdir(root)):
+                p = os.path.join(root, name)
+                if os.path.isdir(p):
+                    sig.append((p, os.stat(p).st_mtime_ns))
+        except OSError:
+            pass
+    return sig
+
+
+def thumb_path(video):
+    """Cache location of the frame thumbnail for a video (may not exist yet)."""
+    try:
+        st = os.stat(video)
+    except OSError:
+        return None
+    key = hashlib.sha1(f"{video}|{st.st_mtime_ns}|{st.st_size}".encode()).hexdigest()
+    return os.path.join(THUMB_DIR, key + ".jpg")
+
+
+def make_thumb(video):
+    """Grab a frame from the video so the thumbnail has the wallpaper's real shape."""
+    out = thumb_path(video)
+    if not out:
+        return None
+    if os.path.isfile(out) and os.path.getsize(out) > 0:
+        return out
+    os.makedirs(THUMB_DIR, exist_ok=True)
+    for seek in ("2", "0"):
+        try:
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", seek, "-i", video,
+                            "-frames:v", "1", "-vf", f"scale={THUMB_W * 2}:-2", out],
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if os.path.isfile(out) and os.path.getsize(out) > 0:
+            return out
+    try:
+        os.remove(out)
+    except OSError:
+        pass
+    return None
+
+
+# ---- mpvpaper -------------------------------------------------------------
+def list_monitors():
+    """Return enabled monitor names, e.g. ['DP-3']."""
+    try:
+        out = subprocess.run(["cosmic-randr", "list"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    out = re.sub(r"\x1b\[[0-9;]*m", "", out)
+    return [m.group(1) for m in re.finditer(r"^(\S+) \(enabled\)", out, re.M)]
+
+
+def tweak_props(t):
+    """Translate tweaks into mpv properties."""
+    scale = min(max(float(t["scale"]), 10.0), 1000.0)
+    return {
+        "panscan": 1.0 if t["fit"] == "fill" else 0.0,
+        "keepaspect": t["fit"] != "stretch",
+        "video-zoom": round(math.log2(scale / 100.0), 4),
+        "video-pan-x": round(float(t["x"]) / 100.0, 4),
+        "video-pan-y": round(float(t["y"]) / 100.0, 4),
+    }
+
+
+def tweak_vf(t):
+    return ",".join(n for n, on in (("hflip", t["fliph"]), ("vflip", t["flipv"])) if on)
+
+
+def mpv_send(commands):
+    """Send commands to the running wallpaper. Returns False if it is not reachable."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(SOCKET)
+        for c in commands:
+            s.sendall((json.dumps({"command": c}) + "\n").encode())
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def apply_tweaks_live(t):
+    cmds = [["set_property", k, v] for k, v in tweak_props(t).items()]
+    cmds.append(["vf", "set", tweak_vf(t)])
+    return mpv_send(cmds)
+
+
+def is_engine_item(key):
+    """Scene and web wallpapers are folders; videos are files."""
+    return bool(key) and os.path.isdir(key)
+
+
+def is_running():
+    return any(subprocess.run(c, capture_output=True).returncode == 0
+               for c in (["pgrep", "-x", "mpvpaper"], ["pgrep", "-f", ENGINE_PATTERN]))
+
+
+def stop_wallpaper():
+    """Stop whichever wallpaper program is running (video player or engine)."""
+    subprocess.run(["pkill", "-x", "mpvpaper"], capture_output=True)
+    try:
+        with open(ENGINE_PID) as f:
+            os.killpg(int(f.read().strip()), signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+    subprocess.run(["pkill", "-f", ENGINE_PATTERN], capture_output=True)
+    # An engine whose picture is hidden behind another one can ignore the polite
+    # request, so wait briefly and then force-stop whatever is left.
+    for _ in range(10):
+        if subprocess.run(["pgrep", "-f", ENGINE_PATTERN], capture_output=True).returncode != 0:
+            break
+        time.sleep(0.1)
+    else:
+        subprocess.run(["pkill", "-KILL", "-f", ENGINE_PATTERN], capture_output=True)
+    try:
+        os.remove(ENGINE_PID)
+    except OSError:
+        pass
+
+
+def start_engine(cfg, key):
+    """Start linux-wallpaperengine for a scene or web wallpaper."""
+    if not os.path.isfile(ENGINE_BIN):
+        return "Scene and web wallpapers need linux-wallpaperengine in " + ENGINE_DIR
+    stop_wallpaper()
+    t = get_tweaks(cfg, key)
+    cmd = ["./linux-wallpaperengine", "--screen-root", cfg["monitor"], "--bg", key,
+           "--scaling", t["fit"] if t["fit"] in FITS else "fill"]
+    if cfg["mute"]:
+        cmd.append("--silent")
+    p = subprocess.Popen(cmd, cwd=ENGINE_DIR, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    try:
+        with open(ENGINE_PID, "w") as f:
+            f.write(str(p.pid))
+    except OSError:
+        pass
+    return None
+
+
+def start_wallpaper(cfg):
+    """Start the selected wallpaper detached. Returns an error string or None."""
+    if not cfg["video"] or not os.path.exists(cfg["video"]):
+        return "Pick a wallpaper first."
+    if not cfg["monitor"]:
+        return "No monitor selected."
+    if is_engine_item(cfg["video"]):
+        return start_engine(cfg, cfg["video"])
+    if not os.path.isfile(MPVPAPER):
+        return "mpvpaper not found at " + MPVPAPER
+    stop_wallpaper()
+    t = get_tweaks(cfg, cfg["video"])
+    opts = ["input-ipc-server=" + SOCKET]
+    if cfg["mute"]:
+        opts.append("no-audio")
+    if cfg["loop"]:
+        opts.append("loop")
+    for k, v in tweak_props(t).items():
+        opts.append(f"{k}={('yes' if v else 'no') if isinstance(v, bool) else v}")
+    if tweak_vf(t):
+        opts.append("vf=" + tweak_vf(t))
+    cmd = [MPVPAPER, "-f", "-o", " ".join(opts), cfg["monitor"], cfg["video"]]
+    subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    return None
+
+
+def set_autostart(enabled):
+    if enabled:
+        os.makedirs(os.path.dirname(AUTOSTART_FILE), exist_ok=True)
+        with open(AUTOSTART_FILE, "w") as f:
+            f.write("[Desktop Entry]\nType=Application\nName=Wallpaper GUI (apply saved wallpaper)\n"
+                    f"Exec={shlex.quote(SELF)} --apply\nX-GNOME-Autostart-Delay=5\nTerminal=false\n")
+    else:
+        try:
+            os.remove(AUTOSTART_FILE)
+        except FileNotFoundError:
+            pass
+
+
+# ---- window ---------------------------------------------------------------
+CSS = """
+window { background: #1a1c22; color: #e6e9ef; }
+.topbar, .bottombar { background: #121419; padding: 8px 12px; }
+.sidebar { background: #22252d; padding: 12px; }
+.heading { font-size: 1.25em; font-weight: bold; }
+.wp-title { font-size: 1.1em; font-weight: bold; }
+.section { font-weight: bold; color: #7fb2ff; margin-top: 10px; }
+.dim { color: #9aa3b2; }
+flowbox { background: transparent; }
+flowboxchild { padding: 3px; border-radius: 6px; }
+flowboxchild:hover { background: #2f3440; }
+flowboxchild:selected { background: #3a8ee6; }
+.thumb-title { background: linear-gradient(transparent, rgba(0, 0, 0, 0.88));
+               color: white; padding: 16px 6px 5px 6px; font-size: 0.85em; }
+.badge { background: rgba(0, 0, 0, 0.7); color: #cfd6e4; font-size: 0.75em;
+         padding: 1px 6px; margin: 4px; border-radius: 4px; }
+.preview { background: #000000; border-radius: 6px; }
+"""
+TEX_W, TEX_H = 480, 270              # thumbnails are stored at this size, then scaled down
+SIDE_W = 330
+PREVIEW_W, PREVIEW_H = 304, 171      # 16:9 box in the side panel
+
+
+def main_gui():
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Gdk", "4.0")
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, Gio
+
+    def label(text="", css=None, **kw):
+        w = Gtk.Label(label=text, xalign=0, **kw)
+        if css:
+            w.add_css_class(css)
+        return w
+
+    class Win(Gtk.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="Live Wallpaper")
+            self.set_default_size(1200, 780)
+            self.cfg = load_config()
+            self.error = False
+            self.items = []
+            self.load_id = 0
+            self.loading = False      # True while controls are being filled in
+            self.save_timer = 0
+            self.engine_dirty = False
+            self.query = ""
+            self.cells = []           # (overlay, picture) for every thumbnail
+            self.sources = {}         # picture -> full-size 16:9 pixbuf
+            self.thumb_w = 0          # current thumbnail width; follows the window size
+
+            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.set_child(root)
+
+            # ---- top bar: heading, search, library buttons ----
+            top = Gtk.Box(spacing=10)
+            top.add_css_class("topbar")
+            top.append(label("Installed", "heading"))
+            self.count_label = label(css="dim")
+            top.append(self.count_label)
+            self.search = Gtk.SearchEntry(placeholder_text="Search wallpapers", hexpand=True)
+            self.search.connect("search-changed", self.on_search)
+            top.append(self.search)
+            self.kind = Gtk.DropDown.new_from_strings(KIND_LABELS)
+            self.kind.connect("notify::selected", lambda *_a: self.flow.invalidate_filter())
+            top.append(self.kind)
+            for text, handler in (("Workshop", self.on_workshop),
+                                  ("Add folder…", self.on_add_folder),
+                                  ("Rescan", lambda _b: self.rescan()),
+                                  ("Open file…", self.on_browse)):
+                b = Gtk.Button(label=text)
+                b.connect("clicked", handler)
+                top.append(b)
+            root.append(top)
+
+            # ---- middle: gallery on the left, properties on the right ----
+            mid = Gtk.Box(vexpand=True)
+            root.append(mid)
+
+            self.flow = Gtk.FlowBox(valign=Gtk.Align.START, halign=Gtk.Align.START,
+                                    homogeneous=True,
+                                    max_children_per_line=12, min_children_per_line=1,
+                                    row_spacing=6, column_spacing=6,
+                                    selection_mode=Gtk.SelectionMode.SINGLE)
+            for side in ("top", "bottom", "start", "end"):
+                getattr(self.flow, f"set_margin_{side}")(10)
+            self.flow.set_filter_func(self.filter_child)
+            self.flow.connect("child-activated", self.on_pick)
+            self.scroll = Gtk.ScrolledWindow(hexpand=True, vexpand=True,
+                                             hscrollbar_policy=Gtk.PolicyType.NEVER)
+            self.scroll.set_child(self.flow)
+            mid.append(self.scroll)
+
+            side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            side.add_css_class("sidebar")
+            side.set_size_request(SIDE_W, -1)
+            self.preview = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, can_shrink=True,
+                                       halign=Gtk.Align.CENTER)
+            self.preview.set_size_request(PREVIEW_W, PREVIEW_H)
+            self.preview.add_css_class("preview")
+            side.append(self.preview)
+            self.video_label = label(css="wp-title", wrap=True, max_width_chars=26)
+            self.video_label.set_wrap_mode(2)  # word or character, for long titles
+            side.append(self.video_label)
+
+            side.append(label("Properties", "section"))
+            self.fit = Gtk.DropDown.new_from_strings(FIT_LABELS)
+            self.fit.connect("notify::selected", self.on_tweak)
+            self.scale = self.slider(25, 400, 5)
+            self.off_x = self.slider(-100, 100, 1)
+            self.off_y = self.slider(-100, 100, 1)
+            for text, widget in (("Alignment", self.fit), ("Scale %", self.scale),
+                                 ("Offset X %", self.off_x), ("Offset Y %", self.off_y)):
+                side.append(label(text, "dim"))
+                side.append(widget)
+            self.fliph = Gtk.CheckButton(label="Flip horizontally")
+            self.flipv = Gtk.CheckButton(label="Flip vertically")
+            for w in (self.fliph, self.flipv):
+                w.connect("toggled", self.on_tweak)
+                side.append(w)
+            reset = Gtk.Button(label="Reset properties", halign=Gtk.Align.START)
+            reset.connect("clicked", self.on_reset)
+            side.append(reset)
+
+            side.append(label("Playback", "section"))
+            self.mute = Gtk.CheckButton(label="Mute", active=self.cfg["mute"])
+            self.loop = Gtk.CheckButton(label="Loop", active=self.cfg["loop"])
+            side.append(self.mute)
+            side.append(self.loop)
+
+            side.append(label("Display", "section"))
+            self.monitors = list_monitors() or ([self.cfg["monitor"]] if self.cfg["monitor"] else [])
+            self.drop = Gtk.DropDown.new_from_strings(self.monitors or ["(none found)"])
+            if self.cfg["monitor"] in self.monitors:
+                self.drop.set_selected(self.monitors.index(self.cfg["monitor"]))
+            side.append(self.drop)
+
+            side_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+            side_scroll.set_hexpand(False)   # keep the panel narrow; the gallery gets the rest
+            side_scroll.set_child(side)
+            mid.append(side_scroll)
+
+            # ---- bottom bar: status, autostart, stop / apply ----
+            bottom = Gtk.Box(spacing=10)
+            bottom.add_css_class("bottombar")
+            self.status = label(css="dim", hexpand=True, ellipsize=3)
+            bottom.append(self.status)
+            self.auto = Gtk.CheckButton(label="Start at login", active=self.cfg["autostart"])
+            bottom.append(self.auto)
+            stop = Gtk.Button(label="Stop")
+            stop.connect("clicked", self.on_stop)
+            bottom.append(stop)
+            start = Gtk.Button(label="Apply")
+            start.add_css_class("suggested-action")
+            start.connect("clicked", self.on_start)
+            bottom.append(start)
+            root.append(bottom)
+
+            self.rescan()
+            self.show_tweaks()
+            self.refresh()
+            GLib.timeout_add_seconds(2, self.refresh)
+            GLib.timeout_add_seconds(5, self.watch_library)
+            GLib.timeout_add(200, self.relayout)
+
+        def slider(self, lo, hi, step):
+            s = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, step)
+            s.set_hexpand(True)
+            s.set_draw_value(True)
+            s.set_value_pos(Gtk.PositionType.RIGHT)
+            s.set_digits(0)
+            s.connect("value-changed", self.on_tweak)
+            return s
+
+        # ---- gallery -------------------------------------------------
+        def rescan(self):
+            self.load_id += 1
+            self.flow.remove_all()
+            self.sig = library_signature(self.cfg["folders"])
+            self.items = scan_folders(self.cfg["folders"])
+            self.cells, self.sources = [], {}
+            w = self.thumb_w or THUMB_W
+            h = round(w * 9 / 16)
+            quick, slow = [], []
+            for item in self.items:
+                # Every thumbnail is locked to 16:9; images are cropped to fill it.
+                pic = Gtk.Picture(content_fit=Gtk.ContentFit.FILL, can_shrink=False,
+                                  halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+                pic.set_size_request(w, h)
+                cell = Gtk.Overlay(tooltip_text=item["title"],
+                                   halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+                cell.set_size_request(w, h)
+                cell.set_child(pic)
+                self.cells.append((cell, pic))
+                title = Gtk.Label(label=item["title"], xalign=0, ellipsize=3,
+                                  valign=Gtk.Align.END, halign=Gtk.Align.FILL)
+                title.add_css_class("thumb-title")
+                cell.add_overlay(title)
+                badge = Gtk.Label(label=item["kind"].capitalize(),
+                                  valign=Gtk.Align.START, halign=Gtk.Align.START)
+                badge.add_css_class("badge")
+                cell.add_overlay(badge)
+                self.flow.append(cell)
+                cached = thumb_path(item["video"]) if item["video"] else None
+                if cached and os.path.isfile(cached) and os.path.getsize(cached) > 0:
+                    quick.append((pic, cached))
+                else:
+                    quick.append((pic, item["preview"]))
+                    if item["video"]:
+                        # Show the Workshop preview first, then swap in a real video frame.
+                        slow.append((pic, item["video"]))
+                if item["key"] == self.cfg["video"]:
+                    self.flow.select_child(cell.get_parent())
+            n, f = len(self.items), len(self.cfg["folders"])
+            self.count_label.set_text(
+                f"{n} wallpaper{'s' if n != 1 else ''}"
+                if f else "No library folder yet. Click “Add folder…”.")
+            GLib.idle_add(self.load_thumbs, iter(quick), self.load_id)
+            if slow:
+                threading.Thread(target=self.thumb_worker, args=(slow, self.load_id),
+                                 daemon=True).start()
+            self.update_preview()
+
+        def scaled(self, path, w, h, cover=False):
+            """Load an image at most w x h. With cover=True it is cropped to exactly w x h."""
+            try:
+                # First frame only; this also handles animated GIF previews.
+                pb = GdkPixbuf.PixbufAnimation.new_from_file(path).get_static_image()
+                iw, ih = pb.get_width(), pb.get_height()
+                s = max(w / iw, h / ih) if cover else min(w / iw, h / ih)
+                nw, nh = max(1, round(iw * s)), max(1, round(ih * s))
+                if cover:
+                    nw, nh = max(w, nw), max(h, nh)
+                pb = pb.scale_simple(nw, nh, GdkPixbuf.InterpType.BILINEAR)
+                if cover:
+                    pb = pb.new_subpixbuf((nw - w) // 2, (nh - h) // 2, w, h)
+                return pb
+            except (GLib.Error, TypeError, AttributeError, ZeroDivisionError):
+                return None
+
+        def load_picture(self, pic, path, w, h):
+            pb = self.scaled(path, w, h)
+            pic.set_paintable(Gdk.Texture.new_for_pixbuf(pb) if pb else None)
+
+        def size_thumb(self, pic):
+            """Draw a thumbnail at the current thumbnail size."""
+            pb = self.sources.get(pic)
+            if pb is not None:
+                w = self.thumb_w or THUMB_W
+                pb = pb.scale_simple(w, round(w * 9 / 16), GdkPixbuf.InterpType.BILINEAR)
+                pic.set_paintable(Gdk.Texture.new_for_pixbuf(pb))
+
+        def relayout(self, force=False):
+            """Fit the grid to the window: at least two columns, thumbnails stay 16:9."""
+            avail = self.scroll.get_width() - 20          # minus the grid margins
+            if avail <= 0:
+                return True
+            cols = max(2, (avail + 6) // (THUMB_W + 12))  # 12 = cell padding + spacing
+            w = max(96, (avail + 6) // cols - 12)
+            if w != self.thumb_w or force:
+                self.thumb_w = w
+                h = round(w * 9 / 16)
+                for cell, pic in self.cells:
+                    pic.set_size_request(w, h)
+                    cell.set_size_request(w, h)
+                    self.size_thumb(pic)
+            return True
+
+        def set_picture(self, pic, path, load_id, video=None):
+            if load_id == self.load_id and path:
+                pb = self.scaled(path, TEX_W, TEX_H, cover=True)
+                if pb is not None:
+                    self.sources[pic] = pb
+                    self.size_thumb(pic)
+                if video and video == self.cfg["video"]:
+                    self.update_preview()
+            return False
+
+        def load_thumbs(self, it, load_id):
+            """Load a few thumbnails per idle tick so the window stays responsive."""
+            if load_id != self.load_id:
+                return False
+            for _ in range(4):
+                try:
+                    pic, path = next(it)
+                except StopIteration:
+                    return False
+                self.set_picture(pic, path, load_id)
+            return True
+
+        def thumb_worker(self, jobs, load_id):
+            """Background thread: extract video frames, hand them to the UI thread."""
+            for pic, video in jobs:
+                if load_id != self.load_id:
+                    return
+                path = make_thumb(video)
+                if path:
+                    GLib.idle_add(self.set_picture, pic, path, load_id, video)
+
+        def update_preview(self):
+            """Large preview of the selected wallpaper in the side panel."""
+            v = self.cfg["video"]
+            path = thumb_path(v) if v and os.path.isfile(v) else None
+            if not (path and os.path.isfile(path) and os.path.getsize(path) > 0):
+                path = next((i["preview"] for i in self.items if i["key"] == v), None)
+            if path:
+                self.load_picture(self.preview, path, PREVIEW_W, PREVIEW_H)
+            else:
+                self.preview.set_paintable(None)
+
+        def on_search(self, entry):
+            self.query = entry.get_text().strip().lower()
+            self.flow.invalidate_filter()
+
+        def filter_child(self, child):
+            i = child.get_index()
+            if not 0 <= i < len(self.items):
+                return False
+            kind = KINDS[min(self.kind.get_selected(), len(KINDS) - 1)]
+            if kind != "all" and self.items[i]["kind"] != kind:
+                return False
+            return not self.query or self.query in self.items[i]["title"].lower()
+
+        def watch_library(self):
+            """Rescan when Steam adds or removes Workshop items."""
+            if library_signature(self.cfg["folders"]) != self.sig:
+                self.rescan()
+                self.refresh()
+            return True
+
+        def on_workshop(self, _btn):
+            # Opens the Wallpaper Engine Workshop inside Steam.
+            url = "steam://openurl/https://steamcommunity.com/workshop/browse/?appid=431960"
+            try:
+                Gio.AppInfo.launch_default_for_uri(url, None)
+                self.status.set_text("Opened the Workshop in Steam. Subscribe to a "
+                                     "wallpaper and it appears here once Steam downloads it.")
+            except GLib.Error as e:
+                self.status.set_text("Error: could not open Steam (" + e.message + ")")
+            self.error = True  # keep this message visible until the next action
+
+        def on_pick(self, _flow, child):
+            """Clicking a thumbnail applies it right away, like Wallpaper Engine."""
+            item = self.items[child.get_index()]
+            self.cfg["video"] = item["key"]
+            self.show_tweaks()
+            self.update_preview()
+            self.on_start(None)
+            self.refresh()
+
+        def on_add_folder(self, _btn):
+            Gtk.FileDialog(title="Choose a wallpaper library folder").select_folder(
+                self, None, self.on_folder_chosen)
+
+        def on_folder_chosen(self, dlg, res):
+            try:
+                path = dlg.select_folder_finish(res).get_path()
+            except GLib.Error:
+                return
+            if path and path not in self.cfg["folders"]:
+                self.cfg["folders"].append(path)
+                save_config(self.cfg)
+            self.rescan()
+
+        def on_browse(self, _btn):
+            dlg = Gtk.FileDialog(title="Choose a video")
+            flt = Gtk.FileFilter()
+            flt.set_name("Videos and GIFs")
+            for ext in ("mp4", "mkv", "webm", "mov", "avi", "m4v", "gif"):
+                flt.add_suffix(ext)
+            store = Gio.ListStore.new(Gtk.FileFilter)
+            store.append(flt)
+            dlg.set_filters(store)
+            dlg.open(self, None, self.on_file_chosen)
+
+        def on_file_chosen(self, dlg, res):
+            try:
+                f = dlg.open_finish(res)
+            except GLib.Error:
+                return
+            self.cfg["video"] = f.get_path()
+            self.flow.unselect_all()
+            self.show_tweaks()
+            self.update_preview()
+            self.refresh()
+
+        # ---- adjustments ---------------------------------------------
+        def show_tweaks(self):
+            """Fill the controls with the selected wallpaper's saved adjustments."""
+            t = get_tweaks(self.cfg, self.cfg["video"])
+            self.loading = True
+            self.fit.set_selected(FITS.index(t["fit"]) if t["fit"] in FITS else 0)
+            self.scale.set_value(t["scale"])
+            self.off_x.set_value(t["x"])
+            self.off_y.set_value(t["y"])
+            self.fliph.set_active(bool(t["fliph"]))
+            self.flipv.set_active(bool(t["flipv"]))
+            self.loading = False
+            # Scene and web wallpapers only support Alignment; the rest is video-only.
+            video = not is_engine_item(self.cfg["video"])
+            for w in (self.scale, self.off_x, self.off_y, self.fliph, self.flipv, self.loop):
+                w.set_sensitive(video)
+
+        def read_tweaks(self):
+            return {"fit": FITS[min(self.fit.get_selected(), len(FITS) - 1)],
+                    "scale": int(self.scale.get_value()),
+                    "x": int(self.off_x.get_value()), "y": int(self.off_y.get_value()),
+                    "fliph": self.fliph.get_active(), "flipv": self.flipv.get_active()}
+
+        def on_tweak(self, *_args):
+            if self.loading or not self.cfg["video"]:
+                return
+            t = self.read_tweaks()
+            self.cfg["tweaks"][self.cfg["video"]] = t
+            self.engine_dirty = is_engine_item(self.cfg["video"])
+            if not self.engine_dirty:
+                apply_tweaks_live(t)      # no-op if the wallpaper is not running
+            if self.save_timer:
+                GLib.source_remove(self.save_timer)
+            self.save_timer = GLib.timeout_add(400, self.flush_config)
+
+        def flush_config(self):
+            self.save_timer = 0
+            save_config(self.cfg)
+            if self.engine_dirty:
+                # The engine cannot change alignment while running, so restart it.
+                self.engine_dirty = False
+                if is_running():
+                    self.on_start(None)
+            return False
+
+        def on_reset(self, _btn):
+            if not self.cfg["video"]:
+                return
+            self.cfg["tweaks"].pop(self.cfg["video"], None)
+            self.show_tweaks()
+            save_config(self.cfg)
+            if is_engine_item(self.cfg["video"]):
+                if is_running():
+                    self.on_start(None)
+            else:
+                apply_tweaks_live(dict(TWEAK_DEFAULTS))
+
+        # ---- controls ------------------------------------------------
+        def refresh(self):
+            v = self.cfg["video"]
+            title = next((i["title"] for i in self.items if i["key"] == v), os.path.basename(v))
+            self.video_label.set_text(title if v else "No wallpaper selected")
+            if not self.error:
+                self.status.set_text("Wallpaper is " + ("running" if is_running() else "stopped"))
+            return True
+
+        def collect(self):
+            sel = self.drop.get_selected()
+            self.cfg["monitor"] = self.monitors[sel] if self.monitors and sel < len(self.monitors) else ""
+            self.cfg["mute"] = self.mute.get_active()
+            self.cfg["loop"] = self.loop.get_active()
+            self.cfg["autostart"] = self.auto.get_active()
+            save_config(self.cfg)
+            set_autostart(self.cfg["autostart"])
+
+        def on_start(self, _btn):
+            self.collect()
+            err = start_wallpaper(self.cfg)
+            self.error = bool(err)
+            if err:
+                self.status.set_text("Error: " + err)
+            else:
+                GLib.timeout_add(800, lambda: self.refresh() and False)
+
+        def on_stop(self, _btn):
+            stop_wallpaper()
+            self.error = False
+            self.refresh()
+
+    class App(Gtk.Application):
+        def __init__(self):
+            super().__init__(application_id="local.wallpaper.gui")
+
+        def do_startup(self):
+            Gtk.Application.do_startup(self)
+            settings = Gtk.Settings.get_default()
+            if settings:
+                settings.set_property("gtk-application-prefer-dark-theme", True)
+            provider = Gtk.CssProvider()
+            if hasattr(provider, "load_from_string"):
+                provider.load_from_string(CSS)
+            else:
+                provider.load_from_data(CSS.encode())
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        def do_activate(self):
+            win = self.get_active_window()
+            (win or Win(self)).present()
+
+    App().run([])
+
+
+if __name__ == "__main__":
+    if "--apply" in sys.argv:
+        err = start_wallpaper(load_config())
+        sys.exit(1 if err else 0)
+    main_gui()
