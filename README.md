@@ -13,10 +13,13 @@ Built and tested on Pop!_OS 24.04 with the COSMIC desktop.
 - Video wallpapers, played with [mpvpaper](https://github.com/GhostNaN/mpvpaper)
 - Scene and web wallpapers, run with [linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine)
 - Each wallpaper's own settings (sliders, toggles, colours, choices), remembered per wallpaper
-- A per-wallpaper switch to draw scene characters as still images, for scenes where the engine leaves them out
+- A per-wallpaper switch to draw scene characters as still images, as a fallback
 - For videos: alignment, scale, offset, flip, brightness, contrast, saturation, hue, gamma and speed, applied live
 - New Workshop downloads appear automatically
 - Optional start at login
+- A background watcher puts the wallpaper back after the screen locks, sleeps or a display is
+  switched, and restarts it if the wallpaper program dies
+- Falls back to an active display when the saved one is not connected
 
 ## Requirements
 
@@ -57,7 +60,15 @@ What it changes:
 - JSON files with trailing commas are accepted
 - File lookups inside packages ignore upper and lower case
 - `--screenshot-delay` is no longer capped at 5 frames
-- `LWPE_NO_PUPPET=1` draws puppet characters as plain images (the app's still-image switch)
+- Puppet characters (animated cut-out models) now draw and move:
+  - their triangles are no longer discarded by materials with back-face culling
+  - the skeleton and keyframes are read from the model and applied every frame, following the
+    scene's animation layers (looping, mirrored and single animations, additive layers)
+  - a mesh that reaches past its layer is moved inside it so it is not cut off
+  - both vertex layouts are read (52-byte and 80-byte), so older models animate too
+  - animations are located by their header, which copes with the optional curve data that
+    follows the keyframes in some models
+- `LWPE_NO_PUPPET=1` draws puppet characters as plain images instead (the app's still-image switch)
 
 The app also sets `LD_LIBRARY_PATH` and `LD_PRELOAD` for web wallpapers so the engine's
 bundled browser library loads correctly.
@@ -65,8 +76,9 @@ bundled browser library loads correctly.
 ## Known limits
 
 - Scene rendering depends on linux-wallpaperengine. In a test of 79 scenes, 75 drew a picture
-  and 4 were blank; about half of the working ones were missing some elements
-  (unsupported object types, shader errors, newer puppet model formats).
+  and 4 were blank. Some are still missing elements (unsupported object types, shader errors).
+- Objects attached to a puppet's bones do not follow them yet, and a few models with unusual
+  mesh data are still drawn as plain images.
 - Web wallpapers that use video formats the engine's browser cannot play show no video.
 - Scale, offset, flip and the colour controls only work for video wallpapers.
 - Changing a scene or web setting restarts that wallpaper.

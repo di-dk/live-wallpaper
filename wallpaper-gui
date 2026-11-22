@@ -45,7 +45,9 @@ FITS = ["fill", "fit", "stretch"]
 FIT_LABELS = ["Fill (crop to cover)", "Fit (show whole video)", "Stretch"]
 
 DEFAULTS = {"video": "", "monitor": "", "mute": True, "loop": True,
-            "autostart": False, "folders": None, "tweaks": {}, "props": {}}
+            "autostart": False, "folders": None, "tweaks": {}, "props": {},
+            # True while a wallpaper is meant to be showing; the watcher keeps it that way
+            "active": False}
 TWEAK_DEFAULTS = {"fit": "fill", "scale": 100, "x": 0, "y": 0, "fliph": False, "flipv": False,
                   "brightness": 0, "contrast": 0, "saturation": 0, "hue": 0, "gamma": 0,
                   "speed": 100,
@@ -398,10 +400,23 @@ def start_engine(cfg, key):
     return None
 
 
+def resolve_monitor(cfg):
+    """The saved display if it is connected and on, otherwise the first one that is.
+
+    Displays come and go (switching inputs, unplugging, a second screen), and the wallpaper
+    programs refuse to start on a display that is not there.
+    """
+    monitors = list_monitors()
+    if not monitors or cfg["monitor"] in monitors:
+        return cfg["monitor"]
+    return monitors[0]
+
+
 def start_wallpaper(cfg):
     """Start the selected wallpaper detached. Returns an error string or None."""
     if not cfg["video"] or not os.path.exists(cfg["video"]):
         return "Pick a wallpaper first."
+    cfg = {**cfg, "monitor": resolve_monitor(cfg)}      # the saved choice itself is left alone
     if not cfg["monitor"]:
         return "No monitor selected."
     if is_engine_item(cfg["video"]):
@@ -430,12 +445,108 @@ def set_autostart(enabled):
         os.makedirs(os.path.dirname(AUTOSTART_FILE), exist_ok=True)
         with open(AUTOSTART_FILE, "w") as f:
             f.write("[Desktop Entry]\nType=Application\nName=Wallpaper GUI (apply saved wallpaper)\n"
-                    f"Exec={shlex.quote(SELF)} --apply\nX-GNOME-Autostart-Delay=5\nTerminal=false\n")
+                    f"Exec={shlex.quote(SELF)} --watch --apply\nX-GNOME-Autostart-Delay=5\nTerminal=false\n")
     else:
         try:
             os.remove(AUTOSTART_FILE)
         except FileNotFoundError:
             pass
+
+
+# ---- watcher --------------------------------------------------------------
+WATCH_LOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "wallpaper-gui-watch.lock")
+WATCH_LOG = os.path.expanduser("~/.cache/wallpaper-gui/watch.log")
+
+
+def spawn_watcher():
+    """Start the background watcher if it is not already running (it holds a lock)."""
+    subprocess.Popen([SELF, "--watch"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def main_watch(apply_now):
+    """Keep the wallpaper showing.
+
+    The compositor destroys a display and creates it again when the screen turns off, for
+    example on the lock screen. The wallpaper's surface goes with it and neither mpvpaper nor
+    linux-wallpaperengine puts it back, so this re-applies the wallpaper when a display
+    appears, and also when the wallpaper program has died.
+    """
+    import fcntl
+    lock = open(WATCH_LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        if apply_now:               # another watcher is running; still honour --apply
+            cfg = load_config()
+            cfg["active"] = True
+            save_config(cfg)
+            start_wallpaper(cfg)
+        return 0
+
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Gdk", "4.0")
+    from gi.repository import Gtk, Gdk, GLib
+
+    def log(message):
+        try:
+            os.makedirs(os.path.dirname(WATCH_LOG), exist_ok=True)
+            if os.path.exists(WATCH_LOG) and os.path.getsize(WATCH_LOG) > 200_000:
+                os.replace(WATCH_LOG, WATCH_LOG + ".old")
+            with open(WATCH_LOG, "a") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + message + "\n")
+        except OSError:
+            pass
+
+    state = {"pending": 0, "down": 0}
+
+    def apply(reason):
+        cfg = load_config()
+        if not cfg.get("active"):
+            return
+        err = start_wallpaper(cfg)
+        log(reason + ": " + (err or "wallpaper started"))
+
+    def reapply_after_display():
+        state["pending"] = 0
+        apply("display came back")
+        return False
+
+    def on_monitors(_model, _position, removed, added):
+        log(f"displays changed: {removed} removed, {added} added")
+        if added and not state["pending"]:
+            # give the compositor a moment to finish setting the display up
+            state["pending"] = GLib.timeout_add(2500, reapply_after_display)
+
+    def check():
+        cfg = load_config()
+        if cfg.get("active") and not is_running() and not state["pending"]:
+            state["down"] += 1
+            if state["down"] >= 2:      # two checks in a row, so a normal switch is not mistaken
+                state["down"] = 0
+                apply("wallpaper was not running")
+        else:
+            state["down"] = 0
+        return True
+
+    Gtk.init()
+    display = Gdk.Display.get_default()
+    monitors = display.get_monitors() if display else None
+    if monitors is not None:
+        monitors.connect("items-changed", on_monitors)
+    log("watcher started" + ("" if monitors is not None else " (no display events available)"))
+
+    if apply_now:
+        cfg = load_config()
+        cfg["active"] = True
+        save_config(cfg)
+        err = start_wallpaper(cfg)
+        log("applied at start: " + (err or "wallpaper started"))
+
+    GLib.timeout_add_seconds(5, check)
+    GLib.MainLoop().run()
+    return 0
 
 
 # ---- window ---------------------------------------------------------------
@@ -1069,15 +1180,19 @@ def main_gui():
             set_autostart(self.cfg["autostart"])
 
         def on_start(self, _btn):
+            self.cfg["active"] = True
             self.collect()
             err = start_wallpaper(self.cfg)
             self.error = bool(err)
             if err:
                 self.status.set_text("Error: " + err)
             else:
+                spawn_watcher()     # brings the wallpaper back after the screen locks or sleeps
                 GLib.timeout_add(800, lambda: self.refresh() and False)
 
         def on_stop(self, _btn):
+            self.cfg["active"] = False
+            save_config(self.cfg)
             stop_wallpaper()
             self.error = False
             self.refresh()
@@ -1107,7 +1222,13 @@ def main_gui():
 
 
 if __name__ == "__main__":
+    if "--watch" in sys.argv:
+        sys.exit(main_watch("--apply" in sys.argv))
     if "--apply" in sys.argv:
-        err = start_wallpaper(load_config())
-        sys.exit(1 if err else 0)
+        _cfg = load_config()
+        _cfg["active"] = True
+        save_config(_cfg)
+        _err = start_wallpaper(_cfg)
+        spawn_watcher()
+        sys.exit(1 if _err else 0)
     main_gui()
