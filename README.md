@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/banner.jpg" alt="Live Wallpaper: animated wallpapers for Linux" width="100%"></p>
+
 # Live Wallpaper
 
 A small Wallpaper Engine style manager for animated wallpapers on Linux (Wayland).
@@ -11,6 +13,7 @@ Built and tested on Pop!_OS 24.04 with the COSMIC desktop.
 - Video wallpapers, played with [mpvpaper](https://github.com/GhostNaN/mpvpaper)
 - Scene and web wallpapers, run with [linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine)
 - Each wallpaper's own settings (sliders, toggles, colours, choices), remembered per wallpaper
+- A per-wallpaper switch to draw scene characters as still images, for scenes where the engine leaves them out
 - For videos: alignment, scale, offset, flip, brightness, contrast, saturation, hue, gamma and speed, applied live
 - New Workshop downloads appear automatically
 - Optional start at login
@@ -54,6 +57,7 @@ What it changes:
 - JSON files with trailing commas are accepted
 - File lookups inside packages ignore upper and lower case
 - `--screenshot-delay` is no longer capped at 5 frames
+- `LWPE_NO_PUPPET=1` draws puppet characters as plain images (the app's still-image switch)
 
 The app also sets `LD_LIBRARY_PATH` and `LD_PRELOAD` for web wallpapers so the engine's
 bundled browser library loads correctly.
@@ -68,6 +72,6 @@ bundled browser library loads correctly.
 - Changing a scene or web setting restarts that wallpaper.
 - Monitor detection only works on COSMIC.
 
-## Icon
+## Artwork
 
-The icon artwork was generated locally with ComfyUI.
+The icon and banner artwork were generated locally with ComfyUI.

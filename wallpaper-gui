@@ -48,7 +48,11 @@ DEFAULTS = {"video": "", "monitor": "", "mute": True, "loop": True,
             "autostart": False, "folders": None, "tweaks": {}, "props": {}}
 TWEAK_DEFAULTS = {"fit": "fill", "scale": 100, "x": 0, "y": 0, "fliph": False, "flipv": False,
                   "brightness": 0, "contrast": 0, "saturation": 0, "hue": 0, "gamma": 0,
-                  "speed": 100}
+                  "speed": 100,
+                  # Scenes: draw animated ("puppet") characters as still images. The engine's
+                  # puppet rendering leaves some characters out; still images bring them back.
+                  "still": False}
+COMPAT_FILE = os.path.join(CONFIG_DIR, "compat.json")
 # Colour controls for video wallpapers: (mpv property, label). All run from -100 to 100.
 VIDEO_COLOUR = [("brightness", "Brightness"), ("contrast", "Contrast"),
                 ("saturation", "Saturation"), ("hue", "Hue shift"), ("gamma", "Gamma")]
@@ -78,9 +82,24 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2)
 
 
+def load_compat():
+    """Per-wallpaper defaults found by testing, keyed by Workshop id, for example
+    {"3273312916": {"still": true}}. Kept in its own file so saving settings never overwrites it."""
+    try:
+        with open(COMPAT_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def get_tweaks(cfg, video):
+    defaults = dict(TWEAK_DEFAULTS)
+    known = COMPAT.get(os.path.basename(video or ""))
+    if isinstance(known, dict):
+        defaults.update({k: v for k, v in known.items() if k in TWEAK_DEFAULTS})
     t = cfg["tweaks"].get(video)
-    return {**TWEAK_DEFAULTS, **t} if isinstance(t, dict) else dict(TWEAK_DEFAULTS)
+    return {**defaults, **t} if isinstance(t, dict) else defaults
 
 
 # ---- library --------------------------------------------------------------
@@ -274,6 +293,9 @@ def stop_wallpaper():
         pass
 
 
+COMPAT = load_compat()
+
+
 def read_project(key):
     """Return (kind, properties) from a wallpaper folder's project.json."""
     try:
@@ -310,8 +332,12 @@ def load_properties(key):
             order = float(p.get("order", 0))
         except (TypeError, ValueError):
             order = 0.0
-        out.append({**p, "name": name, "type": typ, "label": clean_text(p.get("text"), name),
-                    "order": order, "index": i})
+        # Some labels are only an image tag, which cleans to nothing. Fall back to the setting's
+        # internal name unless that is a long machine-generated key.
+        label = clean_text(p.get("text"), "") or (name if len(name) <= 32 else "Setting")
+        if typ in ("text", "group") and label in (name, "Setting"):
+            continue        # a heading with nothing readable in it
+        out.append({**p, "name": name, "type": typ, "label": label, "order": order, "index": i})
     out.sort(key=lambda p: (p["order"], p["index"]))
     return out
 
@@ -332,6 +358,8 @@ def engine_env(cfg, key):
     handed their settings as JSON."""
     env = dict(os.environ)
     kind, props = read_project(key)
+    if get_tweaks(cfg, key)["still"]:
+        env["LWPE_NO_PUPPET"] = "1"
     if kind == "web" and os.path.isfile(os.path.join(ENGINE_DIR, "libcef.so")):
         old = env.get("LD_LIBRARY_PATH")
         env["LD_LIBRARY_PATH"] = ENGINE_DIR + (":" + old if old else "")
@@ -446,6 +474,11 @@ def main_gui():
         w = Gtk.Label(label=text, xalign=0, **kw)
         if css:
             w.add_css_class(css)
+        if kw.get("wrap"):
+            # break anywhere (labels can be one very long word) and never take more than 4 lines
+            w.set_wrap_mode(2)
+            w.set_lines(4)
+            w.set_ellipsize(3)
         return w
 
     class Win(Gtk.ApplicationWindow):
@@ -534,6 +567,12 @@ def main_gui():
                     self.video_only += [lab, widget]
 
             add("Alignment", self.fit, video_only=False)
+            self.still = Gtk.CheckButton(tooltip_text=(
+                "Draws a scene's animated characters as still images. Turn this on when a "
+                "character is missing; turn it off if the character appears in scattered pieces."))
+            self.still.set_child(label("Characters as still images", wrap=True, max_width_chars=30))
+            self.still.connect("toggled", self.on_tweak)
+            side.append(self.still)
             add("Scale %", self.scale)
             add("Offset X %", self.off_x)
             add("Offset Y %", self.off_y)
@@ -575,7 +614,11 @@ def main_gui():
                 self.drop.set_selected(self.monitors.index(self.cfg["monitor"]))
             side.append(self.drop)
 
-            side_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+            # EXTERNAL keeps the panel at a fixed width whatever its contents ask for
+            side_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.EXTERNAL)
+            side_scroll.set_min_content_width(SIDE_W)
+            side_scroll.set_max_content_width(SIDE_W)
+            side_scroll.set_propagate_natural_width(False)
             side_scroll.set_hexpand(False)   # keep the panel narrow; the gallery gets the rest
             side_scroll.set_child(side)
             mid.append(side_scroll)
@@ -838,7 +881,9 @@ def main_gui():
             for name, w in self.colour.items():
                 w.set_value(t[name])
             self.speed.set_value(t["speed"])
+            self.still.set_active(bool(t["still"]))
             self.loading = False
+            self.still.set_visible(is_engine_item(self.cfg["video"]))
             # Scene and web wallpapers only support Alignment; the rest is video-only.
             video = not is_engine_item(self.cfg["video"])
             for w in self.video_only:
@@ -852,7 +897,8 @@ def main_gui():
                     "x": int(self.off_x.get_value()), "y": int(self.off_y.get_value()),
                     "fliph": self.fliph.get_active(), "flipv": self.flipv.get_active(),
                     **{name: int(w.get_value()) for name, w in self.colour.items()},
-                    "speed": int(self.speed.get_value())}
+                    "speed": int(self.speed.get_value()),
+                    "still": self.still.get_active()}
 
         # ---- the wallpaper's own settings ---------------------------
         def show_props(self):

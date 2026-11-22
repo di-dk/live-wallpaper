@@ -301,6 +301,27 @@ index fb34be6..6f41c3f 100644
  	    return true;
  	}
      }
+diff --git a/src/WallpaperEngine/Render/Objects/CImage.cpp b/src/WallpaperEngine/Render/Objects/CImage.cpp
+index 470e295..42dd410 100644
+--- a/src/WallpaperEngine/Render/Objects/CImage.cpp
++++ b/src/WallpaperEngine/Render/Objects/CImage.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "CImage.h"
+ 
+ #include "CRenderable.h"
+@@ -427,6 +428,11 @@ bool CImage::loadPuppetMesh (const glm::vec2& size) {
+ 	return false;
+     }
+ 
++    // puppet (mesh) rendering is incomplete; this lets the image be drawn as a plain picture instead
++    if (std::getenv ("LWPE_NO_PUPPET") != nullptr) {
++	return false;
++    }
++
+     try {
+ 	const auto stream = this->getScene ().getScene ().project.assetLocator->read (*this->getImage ().model->puppet);
+ 	std::vector<char> data { std::istreambuf_iterator<char> (*stream), std::istreambuf_iterator<char> () };
 diff --git a/src/WallpaperEngine/Render/Wallpapers/CWeb.cpp b/src/WallpaperEngine/Render/Wallpapers/CWeb.cpp
 index d174953..e22795a 100644
 --- a/src/WallpaperEngine/Render/Wallpapers/CWeb.cpp
