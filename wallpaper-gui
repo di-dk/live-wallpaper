@@ -9,6 +9,7 @@ Run with no arguments to open the window.
 Run with --apply to start the saved wallpaper without a window (used at login).
 """
 import hashlib
+import html
 import json
 import math
 import os
@@ -44,8 +45,15 @@ FITS = ["fill", "fit", "stretch"]
 FIT_LABELS = ["Fill (crop to cover)", "Fit (show whole video)", "Stretch"]
 
 DEFAULTS = {"video": "", "monitor": "", "mute": True, "loop": True,
-            "autostart": False, "folders": None, "tweaks": {}}
-TWEAK_DEFAULTS = {"fit": "fill", "scale": 100, "x": 0, "y": 0, "fliph": False, "flipv": False}
+            "autostart": False, "folders": None, "tweaks": {}, "props": {}}
+TWEAK_DEFAULTS = {"fit": "fill", "scale": 100, "x": 0, "y": 0, "fliph": False, "flipv": False,
+                  "brightness": 0, "contrast": 0, "saturation": 0, "hue": 0, "gamma": 0,
+                  "speed": 100}
+# Colour controls for video wallpapers: (mpv property, label). All run from -100 to 100.
+VIDEO_COLOUR = [("brightness", "Brightness"), ("contrast", "Contrast"),
+                ("saturation", "Saturation"), ("hue", "Hue shift"), ("gamma", "Gamma")]
+# Wallpaper setting types this app can show (as defined in a wallpaper's project.json).
+PROP_TYPES = ("slider", "bool", "color", "combo", "textinput", "text", "group")
 
 
 # ---- config ---------------------------------------------------------------
@@ -59,6 +67,8 @@ def load_config():
         cfg["folders"] = [DEFAULT_LIBRARY] if os.path.isdir(DEFAULT_LIBRARY) else []
     if not isinstance(cfg["tweaks"], dict):
         cfg["tweaks"] = {}
+    if not isinstance(cfg["props"], dict):
+        cfg["props"] = {}
     return cfg
 
 
@@ -202,6 +212,8 @@ def tweak_props(t):
         "video-zoom": round(math.log2(scale / 100.0), 4),
         "video-pan-x": round(float(t["x"]) / 100.0, 4),
         "video-pan-y": round(float(t["y"]) / 100.0, 4),
+        **{name: int(min(max(float(t[name]), -100), 100)) for name, _label in VIDEO_COLOUR},
+        "speed": round(min(max(float(t["speed"]), 10.0), 400.0) / 100.0, 2),
     }
 
 
@@ -262,6 +274,75 @@ def stop_wallpaper():
         pass
 
 
+def read_project(key):
+    """Return (kind, properties) from a wallpaper folder's project.json."""
+    try:
+        with open(os.path.join(key, "project.json"), encoding="utf-8", errors="replace") as f:
+            meta = json.load(f)
+        kind = str(meta.get("type", "")).strip().lower()
+        props = (meta.get("general") or {}).get("properties") or {}
+        return kind, props if isinstance(props, dict) else {}
+    except (OSError, ValueError, AttributeError):
+        return "", {}
+
+
+def clean_text(text, fallback):
+    """Wallpaper setting labels may hold HTML or Wallpaper Engine translation keys."""
+    t = html.unescape(re.sub(r"<[^>]+>", " ", str(text or "")))
+    t = re.sub(r"\s+", " ", t).strip()
+    if t.startswith("ui_"):
+        t = t.replace("ui_browse_properties_", "").replace("ui_", "").replace("_", " ").strip().capitalize()
+    return t or fallback
+
+
+def load_properties(key):
+    """The wallpaper's own settings, in display order. Empty for plain videos."""
+    if not is_engine_item(key):
+        return []
+    out = []
+    for i, (name, p) in enumerate(read_project(key)[1].items()):
+        if not isinstance(p, dict):
+            continue
+        typ = str(p.get("type", "group")).strip().lower()
+        if typ not in PROP_TYPES:
+            continue
+        try:
+            order = float(p.get("order", 0))
+        except (TypeError, ValueError):
+            order = 0.0
+        out.append({**p, "name": name, "type": typ, "label": clean_text(p.get("text"), name),
+                    "order": order, "index": i})
+    out.sort(key=lambda p: (p["order"], p["index"]))
+    return out
+
+
+def prop_overrides(cfg, key):
+    o = cfg["props"].get(key)
+    return o if isinstance(o, dict) else {}
+
+
+def engine_value(v):
+    """Format a setting value the way linux-wallpaperengine's --set-property expects."""
+    return ("1" if v else "0") if isinstance(v, bool) else str(v)
+
+
+def engine_env(cfg, key):
+    """Environment for the engine. Web wallpapers need its bundled browser library
+    (CEF) found in the engine folder and loaded before the system C library, and are
+    handed their settings as JSON."""
+    env = dict(os.environ)
+    kind, props = read_project(key)
+    if kind == "web" and os.path.isfile(os.path.join(ENGINE_DIR, "libcef.so")):
+        old = env.get("LD_LIBRARY_PATH")
+        env["LD_LIBRARY_PATH"] = ENGINE_DIR + (":" + old if old else "")
+        env["LD_PRELOAD"] = os.path.join(ENGINE_DIR, "libcef.so")
+        over = prop_overrides(cfg, key)
+        values = {name: {"value": over.get(name, p["value"])}
+                  for name, p in props.items() if isinstance(p, dict) and "value" in p}
+        env["LWPE_WEB_PROPERTIES"] = json.dumps(values, ensure_ascii=False)
+    return env
+
+
 def start_engine(cfg, key):
     """Start linux-wallpaperengine for a scene or web wallpaper."""
     if not os.path.isfile(ENGINE_BIN):
@@ -272,7 +353,13 @@ def start_engine(cfg, key):
            "--scaling", t["fit"] if t["fit"] in FITS else "fill"]
     if cfg["mute"]:
         cmd.append("--silent")
-    p = subprocess.Popen(cmd, cwd=ENGINE_DIR, stdin=subprocess.DEVNULL,
+    kind, props = read_project(key)
+    if kind != "web":
+        # Scene settings the user changed go on the command line; web ones go in engine_env.
+        for name, value in prop_overrides(cfg, key).items():
+            if name in props:
+                cmd += ["--set-property", f"{name}={engine_value(value)}"]
+    p = subprocess.Popen(cmd, cwd=ENGINE_DIR, env=engine_env(cfg, key), stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
     try:
@@ -341,6 +428,7 @@ flowboxchild:selected { background: #3a8ee6; }
 .badge { background: rgba(0, 0, 0, 0.7); color: #cfd6e4; font-size: 0.75em;
          padding: 1px 6px; margin: 4px; border-radius: 4px; }
 .preview { background: #000000; border-radius: 6px; }
+.prop-heading { font-weight: bold; margin-top: 6px; }
 """
 TEX_W, TEX_H = 480, 270              # thumbnails are stored at this size, then scaled down
 SIDE_W = 330
@@ -436,18 +524,43 @@ def main_gui():
             self.scale = self.slider(25, 400, 5)
             self.off_x = self.slider(-100, 100, 1)
             self.off_y = self.slider(-100, 100, 1)
-            for text, widget in (("Alignment", self.fit), ("Scale %", self.scale),
-                                 ("Offset X %", self.off_x), ("Offset Y %", self.off_y)):
-                side.append(label(text, "dim"))
+            self.video_only = []      # widgets hidden for scene and web wallpapers
+
+            def add(text, widget, video_only=True):
+                lab = label(text, "dim")
+                side.append(lab)
                 side.append(widget)
+                if video_only:
+                    self.video_only += [lab, widget]
+
+            add("Alignment", self.fit, video_only=False)
+            add("Scale %", self.scale)
+            add("Offset X %", self.off_x)
+            add("Offset Y %", self.off_y)
             self.fliph = Gtk.CheckButton(label="Flip horizontally")
             self.flipv = Gtk.CheckButton(label="Flip vertically")
             for w in (self.fliph, self.flipv):
                 w.connect("toggled", self.on_tweak)
                 side.append(w)
+                self.video_only.append(w)
+
+            heading = label("Colour and speed", "section")
+            side.append(heading)
+            self.video_only.append(heading)
+            self.colour = {}
+            for name, text in VIDEO_COLOUR:
+                self.colour[name] = self.slider(-100, 100, 1)
+                add(text, self.colour[name])
+            self.speed = self.slider(25, 200, 5)
+            add("Playback speed %", self.speed)
             reset = Gtk.Button(label="Reset properties", halign=Gtk.Align.START)
             reset.connect("clicked", self.on_reset)
             side.append(reset)
+
+            # The wallpaper's own settings (from its project.json); rebuilt on selection.
+            side.append(label("Wallpaper settings", "section"))
+            self.props_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            side.append(self.props_box)
 
             side.append(label("Playback", "section"))
             self.mute = Gtk.CheckButton(label="Mute", active=self.cfg["mute"])
@@ -722,17 +835,140 @@ def main_gui():
             self.off_y.set_value(t["y"])
             self.fliph.set_active(bool(t["fliph"]))
             self.flipv.set_active(bool(t["flipv"]))
+            for name, w in self.colour.items():
+                w.set_value(t[name])
+            self.speed.set_value(t["speed"])
             self.loading = False
             # Scene and web wallpapers only support Alignment; the rest is video-only.
             video = not is_engine_item(self.cfg["video"])
-            for w in (self.scale, self.off_x, self.off_y, self.fliph, self.flipv, self.loop):
-                w.set_sensitive(video)
+            for w in self.video_only:
+                w.set_visible(video)
+            self.loop.set_sensitive(video)
+            self.show_props()
 
         def read_tweaks(self):
             return {"fit": FITS[min(self.fit.get_selected(), len(FITS) - 1)],
                     "scale": int(self.scale.get_value()),
                     "x": int(self.off_x.get_value()), "y": int(self.off_y.get_value()),
-                    "fliph": self.fliph.get_active(), "flipv": self.flipv.get_active()}
+                    "fliph": self.fliph.get_active(), "flipv": self.flipv.get_active(),
+                    **{name: int(w.get_value()) for name, w in self.colour.items()},
+                    "speed": int(self.speed.get_value())}
+
+        # ---- the wallpaper's own settings ---------------------------
+        def show_props(self):
+            """Rebuild the settings area for the selected wallpaper."""
+            while (child := self.props_box.get_first_child()) is not None:
+                self.props_box.remove(child)
+            key = self.cfg["video"]
+            props = load_properties(key)
+            if not props:
+                self.props_box.append(label(
+                    "Video wallpapers have no settings of their own."
+                    if key and not is_engine_item(key) else "This wallpaper has no settings.",
+                    "dim", wrap=True, max_width_chars=34))
+                return
+            over = prop_overrides(self.cfg, key)
+            self.loading = True
+            shown = 0
+            for p in props:
+                widget = self.prop_widget(p, over.get(p["name"], p.get("value")))
+                if widget is None:
+                    continue
+                if p["type"] not in ("bool", "text", "group"):
+                    self.props_box.append(label(p["label"], "dim", wrap=True, max_width_chars=34))
+                self.props_box.append(widget)
+                shown += 1
+            self.loading = False
+            if shown:
+                reset = Gtk.Button(label="Reset wallpaper settings", halign=Gtk.Align.START)
+                reset.connect("clicked", self.on_reset_props)
+                self.props_box.append(reset)
+
+        def prop_widget(self, p, value):
+            """Build the control for one wallpaper setting, or None if it cannot be shown."""
+            name, typ = p["name"], p["type"]
+            try:
+                if typ in ("text", "group"):
+                    return label(p["label"], "prop-heading", wrap=True, max_width_chars=34) \
+                        if p["label"] != name or typ == "group" else None
+                if typ == "bool":
+                    w = Gtk.CheckButton(active=bool(value))
+                    w.set_child(label(p["label"], wrap=True, max_width_chars=30))
+                    w.connect("toggled", lambda b: self.on_prop(p, b.get_active()))
+                    return w
+                if typ == "slider":
+                    lo, hi = float(p.get("min", 0)), float(p.get("max", 100))
+                    if hi <= lo:
+                        return None
+                    fraction = bool(p.get("fraction")) or float(p.get("step", 1) or 1) < 1
+                    step = float(p.get("step") or (0.01 if fraction else 1))
+                    w = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, step)
+                    w.set_hexpand(True)
+                    w.set_draw_value(True)
+                    w.set_value_pos(Gtk.PositionType.RIGHT)
+                    w.set_digits(2 if fraction else 0)
+                    w.set_value(float(value))
+                    w.connect("value-changed", lambda s: self.on_prop(
+                        p, round(s.get_value(), 2) if fraction else int(round(s.get_value()))))
+                    return w
+                if typ == "color":
+                    parts = [float(x) for x in str(value).replace(",", " ").split()[:3]]
+                    rgba = Gdk.RGBA()
+                    rgba.red, rgba.green, rgba.blue, rgba.alpha = (parts + [0, 0, 0])[:3] + [1.0]
+                    w = Gtk.ColorDialogButton(dialog=Gtk.ColorDialog(with_alpha=False),
+                                              halign=Gtk.Align.START)
+                    w.set_rgba(rgba)
+                    w.connect("notify::rgba", lambda b, _p: self.on_prop(p, "%.4f %.4f %.4f" % (
+                        b.get_rgba().red, b.get_rgba().green, b.get_rgba().blue)))
+                    return w
+                if typ == "combo":
+                    options = [o for o in p.get("options") or [] if isinstance(o, dict) and "value" in o]
+                    if not options:
+                        return None
+                    w = Gtk.DropDown.new_from_strings(
+                        [clean_text(o.get("label"), str(o["value"])) for o in options])
+                    values = [o["value"] for o in options]
+                    current = [i for i, v in enumerate(values) if str(v) == str(value)]
+                    w.set_selected(current[0] if current else 0)
+                    w.connect("notify::selected", lambda d, _p: self.on_prop(
+                        p, values[min(d.get_selected(), len(values) - 1)]))
+                    return w
+                if typ == "textinput":
+                    w = Gtk.Entry(text=str(value if value is not None else ""))
+                    w.connect("changed", lambda e: self.on_prop(p, e.get_text()))
+                    return w
+            except (TypeError, ValueError):
+                return None
+            return None
+
+        def on_prop(self, p, value):
+            """A wallpaper setting changed: remember it and restart the wallpaper shortly."""
+            key = self.cfg["video"]
+            if self.loading or not key:
+                return
+            over = dict(prop_overrides(self.cfg, key))
+            if str(value) == str(p.get("value")):
+                over.pop(p["name"], None)      # back at the default
+            else:
+                over[p["name"]] = value
+            if over:
+                self.cfg["props"][key] = over
+            else:
+                self.cfg["props"].pop(key, None)
+            self.engine_dirty = True
+            if self.save_timer:
+                GLib.source_remove(self.save_timer)
+            self.save_timer = GLib.timeout_add(700, self.flush_config)
+
+        def on_reset_props(self, _btn):
+            key = self.cfg["video"]
+            if not key:
+                return
+            self.cfg["props"].pop(key, None)
+            save_config(self.cfg)
+            self.show_props()
+            if is_running():
+                self.on_start(None)
 
         def on_tweak(self, *_args):
             if self.loading or not self.cfg["video"]:

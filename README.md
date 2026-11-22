@@ -10,7 +10,8 @@ Built and tested on Pop!_OS 24.04 with the COSMIC desktop.
 - Thumbnail gallery of every wallpaper in your Workshop folder, with search and a type filter
 - Video wallpapers, played with [mpvpaper](https://github.com/GhostNaN/mpvpaper)
 - Scene and web wallpapers, run with [linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine)
-- Per-wallpaper alignment, scale, offset and flip (live for videos)
+- Each wallpaper's own settings (sliders, toggles, colours, choices), remembered per wallpaper
+- For videos: alignment, scale, offset, flip, brightness, contrast, saturation, hue, gamma and speed, applied live
 - New Workshop downloads appear automatically
 - Optional start at login
 
@@ -29,11 +30,44 @@ Built and tested on Pop!_OS 24.04 with the COSMIC desktop.
 ./install.sh
 ```
 
-This copies the app to `~/.local/bin/wallpaper-gui` and adds a "Live Wallpaper" entry to your app menu.
+This copies the app to `~/.local/bin/wallpaper-gui`, installs its icon, and adds a
+"Live Wallpaper" entry to your app menu.
+
+## Engine patch
+
+Web wallpapers and some scenes need fixes that are not in linux-wallpaperengine yet.
+`patches/linux-wallpaperengine-fixes.patch` applies to commit `a0ddce5`:
+
+```sh
+cd ~/.local/src/lwpe
+git apply /path/to/live-wallpaper/patches/linux-wallpaperengine-fixes.patch
+cd build && make -j"$(nproc)" linux-wallpaperengine
+```
+
+What it changes:
+
+- Web wallpapers start: browser helper processes get an intact copy of the arguments
+- Web wallpapers receive their settings through `window.wallpaperPropertyListener`
+  (JSON passed in the `LWPE_WEB_PROPERTIES` environment variable)
+- Static web pages are repainted after a resize
+- A malformed setting no longer stops a wallpaper from loading
+- JSON files with trailing commas are accepted
+- File lookups inside packages ignore upper and lower case
+- `--screenshot-delay` is no longer capped at 5 frames
+
+The app also sets `LD_LIBRARY_PATH` and `LD_PRELOAD` for web wallpapers so the engine's
+bundled browser library loads correctly.
 
 ## Known limits
 
-- Scene support depends on linux-wallpaperengine; not every scene renders correctly.
-- Web wallpapers are untested and may show nothing.
-- Scale, offset and flip only work for video wallpapers.
+- Scene rendering depends on linux-wallpaperengine. In a test of 79 scenes, 75 drew a picture
+  and 4 were blank; about half of the working ones were missing some elements
+  (unsupported object types, shader errors, newer puppet model formats).
+- Web wallpapers that use video formats the engine's browser cannot play show no video.
+- Scale, offset, flip and the colour controls only work for video wallpapers.
+- Changing a scene or web setting restarts that wallpaper.
 - Monitor detection only works on COSMIC.
+
+## Icon
+
+The icon artwork was generated locally with ComfyUI.

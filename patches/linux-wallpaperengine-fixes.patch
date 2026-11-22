@@ -1,0 +1,416 @@
+diff --git a/src/WallpaperEngine/Application/ApplicationContext.cpp b/src/WallpaperEngine/Application/ApplicationContext.cpp
+index e86f750..8836d27 100644
+--- a/src/WallpaperEngine/Application/ApplicationContext.cpp
++++ b/src/WallpaperEngine/Application/ApplicationContext.cpp
+@@ -242,7 +242,12 @@ const ApplicationContext::PlaylistDefinition& ApplicationContext::getPlaylistFro
+     return cur->second;
+ }
+ 
+-ApplicationContext::ApplicationContext (int argc, char* argv[]) : m_argc (argc), m_argv (argv) { }
++ApplicationContext::ApplicationContext (int argc, char* argv[]) : m_argc (argc), m_argv (argv) {
++    // keep our own copy: chromium rewrites the argv memory when it sets the process title
++    for (int i = 1; i < argc; i++) {
++	this->m_savedArgs.emplace_back (argv[i]);
++    }
++}
+ 
+ void ApplicationContext::loadSettingsFromArgv () {
+     std::string lastScreen;
+@@ -669,7 +674,7 @@ void ApplicationContext::loadSettingsFromArgv () {
+ 
+ 	this->settings.audio.volume = std::max (0, std::min (this->settings.audio.volume, 128));
+ 	this->settings.screenshot.delay
+-	    = std::max<uint32_t> (0, std::min<uint32_t> (this->settings.screenshot.delay, 5));
++	    = std::max<uint32_t> (0, std::min<uint32_t> (this->settings.screenshot.delay, 6000));
+ 
+ 	// use std::cout on this in case logging is disabled, this way it's easy to look at what is running
+ 	std::stringbuf buffer;
+@@ -711,6 +716,8 @@ int ApplicationContext::getArgc () const { return this->m_argc; }
+ 
+ char** ApplicationContext::getArgv () const { return this->m_argv; }
+ 
++const std::vector<std::string>& ApplicationContext::getSavedArgs () const { return this->m_savedArgs; }
++
+ std::filesystem::path ApplicationContext::translateBackground (const std::string& bgIdOrPath) {
+     if (bgIdOrPath.find ('/') == std::string::npos) {
+ 	return Steam::FileSystem::workshopDirectory (WORKSHOP_APP_ID, bgIdOrPath);
+diff --git a/src/WallpaperEngine/Application/ApplicationContext.h b/src/WallpaperEngine/Application/ApplicationContext.h
+index 6a73fe9..97b874d 100644
+--- a/src/WallpaperEngine/Application/ApplicationContext.h
++++ b/src/WallpaperEngine/Application/ApplicationContext.h
+@@ -244,8 +244,12 @@ public:
+ 
+     [[nodiscard]] int getArgc () const;
+     [[nodiscard]] char** getArgv () const;
++    /** Private copy of the startup arguments (CEF overwrites the original argv memory) */
++    [[nodiscard]] const std::vector<std::string>& getSavedArgs () const;
+ 
+ private:
++    /** Copy of the program arguments taken on startup, without argv[0] */
++    std::vector<std::string> m_savedArgs;
+     /** Program argument count on startup */
+     int m_argc;
+     /** Program arguments on startup */
+diff --git a/src/WallpaperEngine/Application/WallpaperApplication.cpp b/src/WallpaperEngine/Application/WallpaperApplication.cpp
+index c9107af..a289cbc 100644
+--- a/src/WallpaperEngine/Application/WallpaperApplication.cpp
++++ b/src/WallpaperEngine/Application/WallpaperApplication.cpp
+@@ -225,7 +225,7 @@ void WallpaperApplication::loadBackgrounds () {
+ 
+ ProjectUniquePtr WallpaperApplication::loadBackground (const std::string& bg) {
+     auto container = this->setupAssetLocator (bg);
+-    auto json = WallpaperEngine::Data::JSON::JSON::parse (container->readString ("project.json"));
++    auto json = WallpaperEngine::Data::JSON::parseLenient (container->readString ("project.json"));
+ 
+     // when a background is loaded, reset the screenshot variables
+     // this allows taking screenshots after a background changes
+@@ -348,7 +348,7 @@ bool WallpaperApplication::preflightWallpaper (const std::string& path) {
+     try {
+ 	// avoid mutating state, just ensure project.json parses
+ 	auto container = this->setupAssetLocator (path);
+-	const auto json = WallpaperEngine::Data::JSON::JSON::parse (container->readString ("project.json"));
++	const auto json = WallpaperEngine::Data::JSON::parseLenient (container->readString ("project.json"));
+ 	if (!json.contains ("type") || !json.contains ("file")) {
+ 	    sLog.error ("Preflight failed for ", path, ": missing required fields");
+ 	    return false;
+diff --git a/src/WallpaperEngine/Data/JSON.h b/src/WallpaperEngine/Data/JSON.h
+index 9e2b64e..ee68cfa 100644
+--- a/src/WallpaperEngine/Data/JSON.h
++++ b/src/WallpaperEngine/Data/JSON.h
+@@ -155,4 +155,54 @@ private:
+     [[nodiscard]] const base_type& base () const { return *static_cast<const base_type*> (this); }
+ };
+ 
++/**
++ * Wallpaper Engine's own parser accepts trailing commas in arrays and objects, nlohmann's does not.
++ * Removes them, leaving string contents untouched.
++ */
++inline std::string stripTrailingCommas (const std::string& in) {
++    std::string out;
++    out.reserve (in.size ());
++    bool inString = false;
++    bool escaped = false;
++
++    for (size_t i = 0; i < in.size (); i++) {
++	const char c = in[i];
++
++	if (inString) {
++	    out += c;
++	    if (escaped) {
++		escaped = false;
++	    } else if (c == '\\') {
++		escaped = true;
++	    } else if (c == '"') {
++		inString = false;
++	    }
++	    continue;
++	}
++	if (c == '"') {
++	    inString = true;
++	} else if (c == ',') {
++	    size_t j = i + 1;
++	    while (j < in.size () && (in[j] == ' ' || in[j] == '\t' || in[j] == '\r' || in[j] == '\n')) {
++		j++;
++	    }
++	    if (j < in.size () && (in[j] == ']' || in[j] == '}')) {
++		continue; // drop the comma
++	    }
++	}
++	out += c;
++    }
++
++    return out;
++}
++
++/** Parses JSON written for Wallpaper Engine: strict first, then again without trailing commas */
++inline JSON parseLenient (const std::string& content) {
++    try {
++	return JSON::parse (content);
++    } catch (const nlohmann::detail::parse_error&) {
++	return JSON::parse (stripTrailingCommas (content));
++    }
++}
++
+ } // namespace WallpaperEngine::Data::JSON
+diff --git a/src/WallpaperEngine/Data/Parsers/EffectParser.cpp b/src/WallpaperEngine/Data/Parsers/EffectParser.cpp
+index d3d9450..7c71716 100644
+--- a/src/WallpaperEngine/Data/Parsers/EffectParser.cpp
++++ b/src/WallpaperEngine/Data/Parsers/EffectParser.cpp
+@@ -11,7 +11,7 @@ using namespace WallpaperEngine::Data::Parsers;
+ using namespace WallpaperEngine::Data::Model;
+ 
+ EffectUniquePtr EffectParser::load (const Project& project, const std::string& filename) {
+-    const auto effectJson = JSON::parse (project.assetLocator->readString (filename));
++    const auto effectJson = WallpaperEngine::Data::JSON::parseLenient (project.assetLocator->readString (filename));
+ 
+     return parse (effectJson, project);
+ }
+diff --git a/src/WallpaperEngine/Data/Parsers/MaterialParser.cpp b/src/WallpaperEngine/Data/Parsers/MaterialParser.cpp
+index 689fb80..a8a2e31 100644
+--- a/src/WallpaperEngine/Data/Parsers/MaterialParser.cpp
++++ b/src/WallpaperEngine/Data/Parsers/MaterialParser.cpp
+@@ -10,7 +10,7 @@ using namespace WallpaperEngine::Data::Parsers;
+ using namespace WallpaperEngine::Data::Model;
+ 
+ MaterialUniquePtr MaterialParser::load (const Project& project, const std::string& filename) {
+-    const auto materialJson = JSON::parse (project.assetLocator->readString (filename));
++    const auto materialJson = WallpaperEngine::Data::JSON::parseLenient (project.assetLocator->readString (filename));
+ 
+     return parse (materialJson, filename, project);
+ }
+diff --git a/src/WallpaperEngine/Data/Parsers/ModelParser.cpp b/src/WallpaperEngine/Data/Parsers/ModelParser.cpp
+index 9e90b44..84ee4f9 100644
+--- a/src/WallpaperEngine/Data/Parsers/ModelParser.cpp
++++ b/src/WallpaperEngine/Data/Parsers/ModelParser.cpp
+@@ -11,7 +11,7 @@ using namespace WallpaperEngine::Data::Parsers;
+ using namespace WallpaperEngine::Data::Model;
+ 
+ ModelUniquePtr ModelParser::load (const Project& project, const std::string& filename) {
+-    const auto model = JSON::parse (project.assetLocator->readString (filename));
++    const auto model = WallpaperEngine::Data::JSON::parseLenient (project.assetLocator->readString (filename));
+ 
+     return parse (model, project, filename);
+ }
+diff --git a/src/WallpaperEngine/Data/Parsers/ObjectParser.cpp b/src/WallpaperEngine/Data/Parsers/ObjectParser.cpp
+index 51f92f3..95ecb0d 100644
+--- a/src/WallpaperEngine/Data/Parsers/ObjectParser.cpp
++++ b/src/WallpaperEngine/Data/Parsers/ObjectParser.cpp
+@@ -345,7 +345,7 @@ ParticleUniquePtr ObjectParser::parseParticle (const JSON& it, const Project& pr
+ 	if (!particleFile.empty ()) {
+ 	    try {
+ 		particleJson
+-		    = WallpaperEngine::Data::JSON::JSON::parse (project.assetLocator->readString (particleFile));
++		    = WallpaperEngine::Data::JSON::parseLenient (project.assetLocator->readString (particleFile));
+ 	    } catch (std::runtime_error& e) {
+ 		sLog.error ("Cannot load particle file: ", particleFile, " - ", e.what ());
+ 	    }
+diff --git a/src/WallpaperEngine/Data/Parsers/PropertyParser.cpp b/src/WallpaperEngine/Data/Parsers/PropertyParser.cpp
+index d09591d..afbbc91 100644
+--- a/src/WallpaperEngine/Data/Parsers/PropertyParser.cpp
++++ b/src/WallpaperEngine/Data/Parsers/PropertyParser.cpp
+@@ -5,6 +5,16 @@ using namespace WallpaperEngine::Data::Parsers;
+ using namespace WallpaperEngine::Data::Model;
+ 
+ PropertySharedPtr PropertyParser::parse (const JSON& it, const std::string& name) {
++    // a single malformed property must not prevent the whole wallpaper from loading
++    try {
++	return parseProperty (it, name);
++    } catch (const std::exception& e) {
++	sLog.error ("Ignoring property ", name, ": ", e.what ());
++	return nullptr;
++    }
++}
++
++PropertySharedPtr PropertyParser::parseProperty (const JSON& it, const std::string& name) {
+     // type might not be included, in which case means the same as a group
+     const auto type = it.optional ("type");
+ 
+diff --git a/src/WallpaperEngine/Data/Parsers/PropertyParser.h b/src/WallpaperEngine/Data/Parsers/PropertyParser.h
+index 792d9fe..50afa17 100644
+--- a/src/WallpaperEngine/Data/Parsers/PropertyParser.h
++++ b/src/WallpaperEngine/Data/Parsers/PropertyParser.h
+@@ -9,6 +9,7 @@ using namespace WallpaperEngine::Data::Model;
+ class PropertyParser {
+ public:
+     static PropertySharedPtr parse (const JSON& it, const std::string& name);
++    static PropertySharedPtr parseProperty (const JSON& it, const std::string& name);
+ 
+ private:
+     static PropertySharedPtr parseCombo (const JSON& it, const std::string& name);
+diff --git a/src/WallpaperEngine/Data/Parsers/WallpaperParser.cpp b/src/WallpaperEngine/Data/Parsers/WallpaperParser.cpp
+index c108a0d..b8d2e3f 100644
+--- a/src/WallpaperEngine/Data/Parsers/WallpaperParser.cpp
++++ b/src/WallpaperEngine/Data/Parsers/WallpaperParser.cpp
+@@ -1,5 +1,8 @@
+ #include "WallpaperParser.h"
+ 
++#include <cctype>
++#include <string>
++
+ #include "ObjectParser.h"
+ #include "WallpaperEngine/Data/Model/Project.h"
+ #include "WallpaperEngine/Data/Model/Wallpaper.h"
+@@ -22,12 +25,15 @@ WallpaperUniquePtr WallpaperParser::parse (const JSON& file, Project& project) {
+ }
+ 
+ SceneUniquePtr WallpaperParser::parseScene (const JSON& file, Project& project) {
+-    const auto scene = JSON::parse (project.assetLocator->readString (file));
++    const auto scene = WallpaperEngine::Data::JSON::parseLenient (project.assetLocator->readString (file));
+     const auto camera = scene.require ("camera", "Scenes must have a camera section");
+     const auto general = scene.require ("general", "Scenes must have a general section");
+     const auto projection
+ 	= general.require ("orthogonalprojection", "General section must have orthogonal projection info");
+     const auto objects = scene.require ("objects", "Scenes must have an objects section");
++    // scenes with a perspective camera may have no orthogonal projection at all, treat that as automatic
++    const bool autoProjection
++	= !projection.is_object () || !projection.contains ("width") || projection.optional ("auto", false);
+     const auto& properties = project.properties;
+ 
+     // TODO: FIND IF THESE DEFAULTS ARE SENSIBLE OR NOT AND PERFORM PROPER VALIDATION WHEN CAMERA PREVIEW AND CAMERA
+@@ -69,9 +75,9 @@ SceneUniquePtr WallpaperParser::parseScene (const JSON& file, Project& project)
+                     .up = camera.require <glm::vec3> ("up", "Camera must have an up position"),
+                 },
+                 .projection = {
+-                    .width  = projection.optional ("auto", false) ? 0 : projection.require <int> ("width",  "Projection must have a width"),
+-                    .height = projection.optional ("auto", false) ? 0 : projection.require <int> ("height", "Projection must have a height"),
+-                    .isAuto = projection.optional ("auto", false),
++                    .width  = autoProjection ? 0 : projection.require <int> ("width",  "Projection must have a width"),
++                    .height = autoProjection ? 0 : projection.require <int> ("height", "Projection must have a height"),
++                    .isAuto = autoProjection,
+                     .nearz = camera.user ("nearz", properties, 0.0f),
+                     .farz = camera.user ("farz", properties, 1000.0f),
+                     .fov = camera.user ("fov", properties, 50.0f)
+diff --git a/src/WallpaperEngine/FileSystem/Adapters/Package.cpp b/src/WallpaperEngine/FileSystem/Adapters/Package.cpp
+index fb34be6..6f41c3f 100644
+--- a/src/WallpaperEngine/FileSystem/Adapters/Package.cpp
++++ b/src/WallpaperEngine/FileSystem/Adapters/Package.cpp
+@@ -9,14 +9,26 @@
+ #include "WallpaperEngine/Data/Utils/MemoryStream.h"
+ 
+ #include <algorithm>
++#include <cctype>
++#include <string>
+ 
+ using namespace WallpaperEngine::FileSystem;
+ using namespace WallpaperEngine::FileSystem::Adapters;
+ 
++namespace {
++// Wallpapers are authored on Windows, where file names are case-insensitive
++bool sameFile (const std::string& a, const std::string& b) {
++    return a.size () == b.size ()
++	&& std::equal (a.begin (), a.end (), b.begin (), [] (const unsigned char x, const unsigned char y) {
++	       return std::tolower (x) == std::tolower (y);
++	   });
++}
++} // namespace
++
+ ReadStreamSharedPtr PackageAdapter::open (const std::filesystem::path& path) const {
+     // find the file entry
+     const auto it = std::ranges::find_if (this->package->files, [&path] (const auto& file) {
+-	return file->filename == path.string ();
++	return sameFile (file->filename, path.string ());
+     });
+ 
+     if (it == this->package->files.end ()) {
+@@ -36,7 +48,7 @@ ReadStreamSharedPtr PackageAdapter::open (const std::filesystem::path& path) con
+ 
+ bool PackageAdapter::exists (const std::filesystem::path& path) const {
+     for (const auto& file : this->package->files) {
+-	if (file->filename == path.string ()) {
++	if (sameFile (file->filename, path.string ())) {
+ 	    return true;
+ 	}
+     }
+diff --git a/src/WallpaperEngine/Render/Wallpapers/CWeb.cpp b/src/WallpaperEngine/Render/Wallpapers/CWeb.cpp
+index d174953..e22795a 100644
+--- a/src/WallpaperEngine/Render/Wallpapers/CWeb.cpp
++++ b/src/WallpaperEngine/Render/Wallpapers/CWeb.cpp
+@@ -54,6 +54,9 @@ void CWeb::setSize (const int width, const int height) {
+ 
+     // Notify cef that it was resized(maybe it's not even needed)
+     this->m_browser->GetHost ()->WasResized ();
++    // ask for a full repaint at the new size; pages that never change on their own
++    // (for example with overflow: hidden) are otherwise never painted again
++    this->m_browser->GetHost ()->Invalidate (PET_VIEW);
+ }
+ 
+ void CWeb::renderFrame (const glm::ivec4& viewport) {
+diff --git a/src/WallpaperEngine/WebBrowser/CEF/BrowserApp.cpp b/src/WallpaperEngine/WebBrowser/CEF/BrowserApp.cpp
+index 93c82ed..daf460d 100644
+--- a/src/WallpaperEngine/WebBrowser/CEF/BrowserApp.cpp
++++ b/src/WallpaperEngine/WebBrowser/CEF/BrowserApp.cpp
+@@ -48,7 +48,8 @@ if (process_type.empty()) {
+ 
+ void BrowserApp::OnBeforeChildProcessLaunch (CefRefPtr<CefCommandLine> command_line) {
+     // add back any parameters we had before so the new process can load up everything needed
+-    for (int i = 1; i < this->getApplication ().getContext ().getArgc (); i++) {
+-	command_line->AppendArgument (this->getApplication ().getContext ().getArgv ()[i]);
++    // use the saved copy: the original argv memory has been overwritten by chromium at this point
++    for (const auto& arg : this->getApplication ().getContext ().getSavedArgs ()) {
++	command_line->AppendArgument (arg);
+     }
+ }
+\ No newline at end of file
+diff --git a/src/WallpaperEngine/WebBrowser/CEF/BrowserClient.cpp b/src/WallpaperEngine/WebBrowser/CEF/BrowserClient.cpp
+index 14618ce..5b13621 100644
+--- a/src/WallpaperEngine/WebBrowser/CEF/BrowserClient.cpp
++++ b/src/WallpaperEngine/WebBrowser/CEF/BrowserClient.cpp
+@@ -1,7 +1,39 @@
+ #include "BrowserClient.h"
+ 
++#include <cstdlib>
++#include <string>
++
+ using namespace WallpaperEngine::WebBrowser::CEF;
+ 
+ BrowserClient::BrowserClient (CefRefPtr<CefRenderHandler> ptr) : m_renderHandler (std::move (ptr)) { }
+ 
+-CefRefPtr<CefRenderHandler> BrowserClient::GetRenderHandler () { return m_renderHandler; }
+\ No newline at end of file
++CefRefPtr<CefRenderHandler> BrowserClient::GetRenderHandler () { return m_renderHandler; }
++
++CefRefPtr<CefLoadHandler> BrowserClient::GetLoadHandler () { return this; }
++
++void BrowserClient::OnLoadEnd (CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, int httpStatusCode) {
++    if (!frame->IsMain ()) {
++	return;
++    }
++
++    // The properties come as a JSON object in Wallpaper Engine's format:
++    //   { "name": { "value": ... }, ... }
++    // taken from the LWPE_WEB_PROPERTIES environment variable. Without it the page still
++    // gets the callback, with an empty object.
++    const char* env = std::getenv ("LWPE_WEB_PROPERTIES");
++    std::string properties = env != nullptr ? env : "{}";
++
++    if (properties.empty () || properties.front () != '{') {
++	properties = "{}";
++    }
++
++    // the listener may be registered a little after the load event, so retry for a few seconds
++    const std::string script = "(function(){var p=" + properties
++	+ ";var n=0;(function go(){var l=window.wallpaperPropertyListener;"
++	  "if(l){try{if(l.applyGeneralProperties){l.applyGeneralProperties({fps:60});}"
++	  "if(l.applyUserProperties){l.applyUserProperties(p);}}"
++	  "catch(e){console.log('wallpaper properties: '+e);}}"
++	  "else if(n++<100){setTimeout(go,100);}})();})();";
++
++    frame->ExecuteJavaScript (script, frame->GetURL (), 0);
++}
+diff --git a/src/WallpaperEngine/WebBrowser/CEF/BrowserClient.h b/src/WallpaperEngine/WebBrowser/CEF/BrowserClient.h
+index 499bb73..8cdd31e 100644
+--- a/src/WallpaperEngine/WebBrowser/CEF/BrowserClient.h
++++ b/src/WallpaperEngine/WebBrowser/CEF/BrowserClient.h
+@@ -1,20 +1,29 @@
+ #pragma once
+ 
+ #include "include/cef_client.h"
++#include "include/cef_load_handler.h"
+ 
+ namespace WallpaperEngine::WebBrowser::CEF {
+ // *************************************************************************
+ //! \brief Provide access to browser-instance-specific callbacks. A single
+ //! CefClient instance can be shared among any number of browsers.
+ // *************************************************************************
+-class BrowserClient : public CefClient {
++class BrowserClient : public CefClient, public CefLoadHandler {
+ public:
+     explicit BrowserClient (CefRefPtr<CefRenderHandler> ptr);
+ 
+     [[nodiscard]] CefRefPtr<CefRenderHandler> GetRenderHandler () override;
++    [[nodiscard]] CefRefPtr<CefLoadHandler> GetLoadHandler () override;
++
++    /**
++     * Web wallpapers expect Wallpaper Engine to hand them their user properties once the page
++     * is loaded, through window.wallpaperPropertyListener. Many only finish setting themselves
++     * up (backgrounds, colors, positions) inside that callback.
++     */
++    void OnLoadEnd (CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, int httpStatusCode) override;
+ 
+     CefRefPtr<CefRenderHandler> m_renderHandler = nullptr;
+ 
+     IMPLEMENT_REFCOUNTING (BrowserClient);
+ };
+-} // namespace WallpaperEngine::WebBrowser::CEF
+\ No newline at end of file
++} // namespace WallpaperEngine::WebBrowser::CEF
