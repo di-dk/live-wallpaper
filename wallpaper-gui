@@ -661,6 +661,12 @@ def main_gui():
             self.video_label = label(css="wp-title", wrap=True, max_width_chars=26)
             self.video_label.set_wrap_mode(2)  # word or character, for long titles
             side.append(self.video_label)
+            self.video_label.set_selectable(True)
+            self.copy_btn = Gtk.Button(label="Copy name", halign=Gtk.Align.START,
+                                       tooltip_text="Copy this wallpaper's name and Workshop ID")
+            self.copy_btn.add_css_class("flat")
+            self.copy_btn.connect("clicked", self.on_copy_name)
+            side.append(self.copy_btn)
 
             side.append(label("Properties", "section"))
             self.fit = Gtk.DropDown.new_from_strings(FIT_LABELS)
@@ -941,6 +947,17 @@ def main_gui():
             self.update_preview()
             self.on_start(None)
             self.refresh()
+
+        def on_copy_name(self, _btn):
+            v = self.cfg["video"]
+            if not v:
+                return
+            title = next((i["title"] for i in self.items if i["key"] == v), os.path.basename(v))
+            folder = os.path.basename(v if os.path.isdir(v) else os.path.dirname(v))
+            text = f"{title} ({folder})" if folder.isdigit() else title
+            self.get_clipboard().set(text)
+            self.copy_btn.set_label("Copied")
+            GLib.timeout_add(1500, lambda: self.copy_btn.set_label("Copy name") and False)
 
         def on_add_folder(self, _btn):
             Gtk.FileDialog(title="Choose a wallpaper library folder").select_folder(

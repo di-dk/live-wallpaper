@@ -1,0 +1,71 @@
+diff --git a/glslang/MachineIndependent/Intermediate.cpp b/glslang/MachineIndependent/Intermediate.cpp
+index 2f9b2bc..47b806c 100644
+--- a/glslang/MachineIndependent/Intermediate.cpp
++++ b/glslang/MachineIndependent/Intermediate.cpp
+@@ -1002,14 +1002,8 @@ TIntermTyped* TIntermediate::addConversion(TOperator op, const TType& type, TInt
+ //
+ TIntermTyped* TIntermediate::addUniShapeConversion(TOperator op, const TType& type, TIntermTyped* node)
+ {
+-    // some source languages don't do this
+-    switch (getSource()) {
+-    case EShSourceHlsl:
+-        break;
+-    case EShSourceGlsl:
+-    default:
+-        return node;
+-    }
++    // Wallpaper Engine shaders are written against HLSL's rules (vectors are truncated
++    // implicitly, scalars are widened), so GLSL sources get the same shape conversions
+ 
+     // some operations don't do this
+     switch (op) {
+@@ -1055,14 +1049,8 @@ TIntermTyped* TIntermediate::addUniShapeConversion(TOperator op, const TType& ty
+ //
+ void TIntermediate::addBiShapeConversion(TOperator op, TIntermTyped*& lhsNode, TIntermTyped*& rhsNode)
+ {
+-    // some source languages don't do this
+-    switch (getSource()) {
+-    case EShSourceHlsl:
+-        break;
+-    case EShSourceGlsl:
+-    default:
+-        return;
+-    }
++    // Wallpaper Engine shaders are written against HLSL's rules (vectors are truncated
++    // implicitly, scalars are widened), so GLSL sources get the same shape conversions
+ 
+     // some operations don't do this
+     // 'break' will mean attempt bidirectional conversion
+@@ -1412,7 +1400,8 @@ bool TIntermediate::canImplicitlyPromote(TBasicType from, TBasicType to, TOperat
+ 
+     // TODO: Move more policies into language-specific handlers.
+     // Some languages allow more general (or potentially, more specific) conversions under some conditions.
+-    if (getSource() == EShSourceHlsl) {
++    // (Wallpaper Engine shaders rely on HLSL's rules, so this applies to GLSL sources as well.)
++    {
+         const bool fromConvertable = (from == EbtFloat || from == EbtDouble || from == EbtInt || from == EbtUint || from == EbtBool);
+         const bool toConvertable = (to == EbtFloat || to == EbtDouble || to == EbtInt || to == EbtUint || to == EbtBool);
+ 
+diff --git a/glslang/MachineIndependent/ParseHelper.cpp b/glslang/MachineIndependent/ParseHelper.cpp
+index b0c609b..927f010 100644
+--- a/glslang/MachineIndependent/ParseHelper.cpp
++++ b/glslang/MachineIndependent/ParseHelper.cpp
+@@ -7568,13 +7568,16 @@ const TFunction* TParseContext::findFunction120(const TSourceLoc& loc, const TFu
+                 if (call[i].type->canUseVecConstructorForHigherType(*function[i].type)) {
+                     requiresCasts++;
+                 }
++                if (function[i].type->getBasicType() != call[i].type->getBasicType()) {
++                    requiresCasts++;
++                }
+                 // do direction-specific checks for conversion of basic type
+                 if (function[i].type->getQualifier().isParamInput()) {
+-                    if (! intermediate.canImplicitlyPromote(call[i].type->getBasicType(), function[i].type->getBasicType()))
++                    if (! intermediate.canImplicitlyPromote(call[i].type->getBasicType(), function[i].type->getBasicType(), EOpFunctionCall))
+                         possibleMatch = false;
+                 }
+                 if (function[i].type->getQualifier().isParamOutput()) {
+-                    if (! intermediate.canImplicitlyPromote(function[i].type->getBasicType(), call[i].type->getBasicType()))
++                    if (! intermediate.canImplicitlyPromote(function[i].type->getBasicType(), call[i].type->getBasicType(), EOpFunctionCall))
+                         possibleMatch = false;
+                 }
+             }

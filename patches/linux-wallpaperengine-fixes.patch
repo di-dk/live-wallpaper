@@ -132,11 +132,198 @@ index 9e2b64e..ee68cfa 100644
 +}
 +
  } // namespace WallpaperEngine::Data::JSON
+diff --git a/src/WallpaperEngine/Data/Model/DynamicValue.cpp b/src/WallpaperEngine/Data/Model/DynamicValue.cpp
+index d41028f..deeaa3e 100644
+--- a/src/WallpaperEngine/Data/Model/DynamicValue.cpp
++++ b/src/WallpaperEngine/Data/Model/DynamicValue.cpp
+@@ -1,3 +1,6 @@
++#include <vector>
++#include <cmath>
++#include <algorithm>
+ #include "DynamicValue.h"
+ #include "UserSetting.h"
+ 
+@@ -7,6 +10,10 @@
+ 
+ using namespace WallpaperEngine::Data::Model;
+ 
++namespace {
++std::vector<DynamicValue*>& timelineValues ();
++}
++
+ DynamicValue::DynamicValue (const DynamicValue& other) {
+     this->DynamicValue::update (other, UpdateSource::Initialization);
+ }
+@@ -38,6 +45,9 @@ DynamicValue::DynamicValue (const Model::Color& value) {
+ }
+ 
+ DynamicValue::~DynamicValue () {
++    if (this->m_timeline.has_value ()) {
++	std::erase (timelineValues (), this);
++    }
+     // TODO: PROPERLY FIX THESE
+     if (this->m_aliveFlag) {
+ 	*this->m_aliveFlag = false;
+@@ -301,3 +311,107 @@ void DynamicValue::propagate (UpdateSource source) const {
+ 	callback (*this, source);
+     }
+ }
++
++
++namespace {
++std::vector<DynamicValue*>& timelineValues () {
++    static std::vector<DynamicValue*> values;
++    return values;
++}
++
++float sampleTimeline (const std::vector<DynamicValue::TimelineKey>& keys, const float frame, const float fallback) {
++    if (keys.empty ()) {
++	return fallback;
++    }
++    if (frame <= keys.front ().frame) {
++	return keys.front ().value;
++    }
++    for (size_t index = 0; index + 1 < keys.size (); index++) {
++	const auto& from = keys[index];
++	const auto& to = keys[index + 1];
++	if (frame > to.frame) {
++	    continue;
++	}
++	const float span = to.frame - from.frame;
++	float mix = span > 0.0f ? (frame - from.frame) / span : 1.0f;
++	// the editor's default curve handles ease in and out
++	mix = mix * mix * (3.0f - 2.0f * mix);
++	return from.value + (to.value - from.value) * mix;
++    }
++    return keys.back ().value;
++}
++} // namespace
++
++void DynamicValue::setTimeline (Timeline timeline) {
++    if (!this->m_timeline.has_value ()) {
++	timelineValues ().push_back (this);
++    }
++    this->m_timeline = std::move (timeline);
++}
++
++void DynamicValue::tickTimelines (const float time) {
++    for (DynamicValue* value : timelineValues ()) {
++	value->applyTimeline (time);
++    }
++}
++
++void DynamicValue::applyTimeline (const float time) {
++    const Timeline& timeline = *this->m_timeline;
++    float length = timeline.length;
++    for (const auto& channel : timeline.channels) {
++	if (!channel.empty ()) {
++	    length = std::max (length, channel.back ().frame);
++	}
++    }
++    if (length <= 0.0f) {
++	return;
++    }
++
++    float frame = time * timeline.fps;
++    if (timeline.mode == 2) {
++	frame = std::min (frame, length);
++    } else if (timeline.mode == 1) {
++	frame = std::fmod (frame, length * 2.0f);
++	if (frame > length) {
++	    frame = length * 2.0f - frame;
++	}
++    } else {
++	frame = std::fmod (frame, length);
++    }
++
++    const auto channel = [&timeline, frame] (const size_t index, const float fallback) {
++	return index < timeline.channels.size () ? sampleTimeline (timeline.channels[index], frame, fallback) : fallback;
++    };
++
++    switch (this->m_type) {
++	case Float:
++	    this->update (channel (0, this->m_float), UpdateSource::Script);
++	    break;
++	case Int:
++	    this->update (static_cast<int> (std::lround (channel (0, static_cast<float> (this->m_int)))), UpdateSource::Script);
++	    break;
++	case Boolean:
++	    this->update (channel (0, this->m_bool ? 1.0f : 0.0f) > 0.5f, UpdateSource::Script);
++	    break;
++	case Vec2:
++	    this->update (glm::vec2 (channel (0, this->m_vec2.x), channel (1, this->m_vec2.y)), UpdateSource::Script);
++	    break;
++	case Vec3:
++	    this->update (
++		glm::vec3 (channel (0, this->m_vec3.x), channel (1, this->m_vec3.y), channel (2, this->m_vec3.z)),
++		UpdateSource::Script
++	    );
++	    break;
++	case Vec4:
++	    this->update (
++		glm::vec4 (
++		    channel (0, this->m_vec4.x), channel (1, this->m_vec4.y), channel (2, this->m_vec4.z),
++		    channel (3, this->m_vec4.w)
++		),
++		UpdateSource::Script
++	    );
++	    break;
++	default:
++	    break;
++    }
++}
+diff --git a/src/WallpaperEngine/Data/Model/DynamicValue.h b/src/WallpaperEngine/Data/Model/DynamicValue.h
+index 4843dca..e19a882 100644
+--- a/src/WallpaperEngine/Data/Model/DynamicValue.h
++++ b/src/WallpaperEngine/Data/Model/DynamicValue.h
+@@ -137,7 +137,33 @@ public:
+      */
+     void setProperties (std::map<std::string, UserSettingUniquePtr> properties);
+ 
++    /** One keyframe of a timeline animation */
++    struct TimelineKey {
++	float frame;
++	float value;
++    };
++    /** A keyframe animation attached to the value in the editor ("animation" in the scene file) */
++    struct Timeline {
++	/** One list of keyframes per component (c0, c1, ...) */
++	std::vector<std::vector<TimelineKey>> channels;
++	float fps = 30.0f;
++	float length = 0.0f;
++	/** 0 = loop, 1 = mirror, 2 = single */
++	int mode = 0;
++    };
++    /**
++     * Attaches a keyframe animation; the value then follows it on every call to tickTimelines
++     */
++    void setTimeline (Timeline timeline);
++    /**
++     * Moves every value that has a keyframe animation to the given time (in seconds)
++     */
++    static void tickTimelines (float time);
++
+ private:
++    void applyTimeline (float time);
++    std::optional<Timeline> m_timeline = std::nullopt;
++
+     /**
+      * Notifies any listeners that the value has changed
+      */
 diff --git a/src/WallpaperEngine/Data/Model/Object.h b/src/WallpaperEngine/Data/Model/Object.h
-index 8c9f522..05749bc 100644
+index 8c9f522..9394af8 100644
 --- a/src/WallpaperEngine/Data/Model/Object.h
 +++ b/src/WallpaperEngine/Data/Model/Object.h
-@@ -93,6 +93,8 @@ struct ImageAnimationLayer {
+@@ -25,6 +25,8 @@ struct ObjectData {
+     std::string name;
+     std::vector<int> dependencies;
+     std::optional<int> parent;
++    /** Name of the attachment point on the parent's puppet model this object is pinned to */
++    std::string attachment = {};
+     /** The point of origin of the object */
+     UserSettingUniquePtr origin;
+     /** Transform fields for generic scene/group objects. Typed objects keep their own transform fields. */
+@@ -93,6 +95,8 @@ struct ImageAnimationLayer {
      UserSettingUniquePtr visible;
      UserSettingUniquePtr blend;
      UserSettingUniquePtr animation;
@@ -145,6 +332,62 @@ index 8c9f522..05749bc 100644
  };
  
  struct ImageData {
+diff --git a/src/WallpaperEngine/Data/Parsers/DynamicValueParser.cpp b/src/WallpaperEngine/Data/Parsers/DynamicValueParser.cpp
+index 777fa1a..0c35bcb 100644
+--- a/src/WallpaperEngine/Data/Parsers/DynamicValueParser.cpp
++++ b/src/WallpaperEngine/Data/Parsers/DynamicValueParser.cpp
+@@ -63,6 +63,51 @@ DynamicValueUniquePtr DynamicValueParser::parse (const json& data, const Propert
+ 	value->update (DynamicValue::UpdateSource::Initialization);
+     }
+ 
++    // keyframe animation made in the editor's timeline
++    if (data.is_object ()) {
++	const auto animationIt = data.find ("animation");
++	if (animationIt != data.end () && animationIt->is_object ()) {
++	    try {
++		DynamicValue::Timeline timeline;
++		for (int index = 0; index < 4; index++) {
++		    const auto channelIt = animationIt->find ("c" + std::to_string (index));
++		    if (channelIt == animationIt->end () || !channelIt->is_array ()) {
++			break;
++		    }
++		    std::vector<DynamicValue::TimelineKey> keys;
++		    for (const auto& key : *channelIt) {
++			if (key.is_object () && key.contains ("frame") && key.contains ("value") && key["frame"].is_number ()
++			    && key["value"].is_number ()) {
++			    keys.push_back ({ key["frame"].get<float> (), key["value"].get<float> () });
++			}
++		    }
++		    timeline.channels.push_back (std::move (keys));
++		}
++		const auto optionsIt = animationIt->find ("options");
++		if (optionsIt != animationIt->end () && optionsIt->is_object ()) {
++		    const auto fpsIt = optionsIt->find ("fps");
++		    const auto lengthIt = optionsIt->find ("length");
++		    const auto modeIt = optionsIt->find ("mode");
++		    if (fpsIt != optionsIt->end () && fpsIt->is_number ()) {
++			timeline.fps = fpsIt->get<float> ();
++		    }
++		    if (lengthIt != optionsIt->end () && lengthIt->is_number ()) {
++			timeline.length = lengthIt->get<float> ();
++		    }
++		    if (modeIt != optionsIt->end () && modeIt->is_string ()) {
++			const std::string mode = modeIt->get<std::string> ();
++			timeline.mode = mode == "single" ? 2 : (mode == "mirror" ? 1 : 0);
++		    }
++		}
++		if (!timeline.channels.empty () && timeline.fps > 0.0f) {
++		    value->setTimeline (std::move (timeline));
++		}
++	    } catch (const std::exception&) {
++		// keep the static value
++	    }
++	}
++    }
++
+     if (scriptSource.has_value ()) {
+ 	std::map<std::string, UserSettingUniquePtr> scriptProps;
+ 
 diff --git a/src/WallpaperEngine/Data/Parsers/EffectParser.cpp b/src/WallpaperEngine/Data/Parsers/EffectParser.cpp
 index d3d9450..7c71716 100644
 --- a/src/WallpaperEngine/Data/Parsers/EffectParser.cpp
@@ -185,10 +428,26 @@ index 9e90b44..84ee4f9 100644
      return parse (model, project, filename);
  }
 diff --git a/src/WallpaperEngine/Data/Parsers/ObjectParser.cpp b/src/WallpaperEngine/Data/Parsers/ObjectParser.cpp
-index 51f92f3..63eaecd 100644
+index 51f92f3..b6d1895 100644
 --- a/src/WallpaperEngine/Data/Parsers/ObjectParser.cpp
 +++ b/src/WallpaperEngine/Data/Parsers/ObjectParser.cpp
-@@ -290,6 +290,7 @@ ImageAnimationLayerUniquePtr ObjectParser::parseAnimationLayer (const JSON& it,
+@@ -41,6 +41,7 @@ ObjectUniquePtr ObjectParser::parse (const JSON& it, const Project& project) {
+ 	    .name = it.require<std::string> ("name", "Object must have a name"),
+ 	    .dependencies = parseDependencies (it),
+ 	    .parent = it.optional<int> ("parent"),
++	    .attachment = it.optional<std::string> ("attachment", std::string ()),
+ 	    .origin = it.user ("origin", project.properties, glm::vec3 (0.0f)),
+ 	    .groupScale = it.user ("scale", project.properties, glm::vec3 (1.0f)),
+ 	    .groupAngles = it.user ("angles", project.properties, glm::vec3 (0.0f)),
+@@ -64,6 +65,7 @@ ObjectUniquePtr ObjectParser::parse (const JSON& it, const Project& project) {
+ 	    .name = name,
+ 	    .dependencies = parseDependencies (it),
+ 	    .parent = it.optional<int> ("parent"),
++	    .attachment = it.optional<std::string> ("attachment", std::string ()),
+ 	    .origin = it.user ("origin", project.properties, glm::vec3 (0.0f)),
+ 	    .groupScale = it.user ("scale", project.properties, glm::vec3 (1.0f)),
+ 	    .groupAngles = it.user ("angles", project.properties, glm::vec3 (0.0f)),
+@@ -290,6 +292,7 @@ ImageAnimationLayerUniquePtr ObjectParser::parseAnimationLayer (const JSON& it,
  	.visible = it.user ("visible", properties, false),
  	.blend = it.user ("blend", properties, 1.0f),
  	.animation = it.user ("animation", properties, 0),
@@ -196,7 +455,7 @@ index 51f92f3..63eaecd 100644
      });
  }
  
-@@ -345,7 +346,7 @@ ParticleUniquePtr ObjectParser::parseParticle (const JSON& it, const Project& pr
+@@ -345,7 +348,7 @@ ParticleUniquePtr ObjectParser::parseParticle (const JSON& it, const Project& pr
  	if (!particleFile.empty ()) {
  	    try {
  		particleJson
@@ -323,7 +582,7 @@ index fb34be6..6f41c3f 100644
  	}
      }
 diff --git a/src/WallpaperEngine/Render/Objects/CImage.cpp b/src/WallpaperEngine/Render/Objects/CImage.cpp
-index 470e295..c9f7e67 100644
+index 470e295..7f17bb9 100644
 --- a/src/WallpaperEngine/Render/Objects/CImage.cpp
 +++ b/src/WallpaperEngine/Render/Objects/CImage.cpp
 @@ -1,3 +1,7 @@
@@ -334,7 +593,113 @@ index 470e295..c9f7e67 100644
  #include "CImage.h"
  
  #include "CRenderable.h"
-@@ -422,24 +426,570 @@ CImage::~CImage () {
+@@ -129,13 +133,19 @@ CImage::ResolvedTransform CImage::localTransform (const Object& object) {
+ }
+ 
+ CImage::ResolvedTransform CImage::resolveTransform (const Object& object) const {
++    return resolveTransform (this->getScene (), object);
++}
++
++CImage::ResolvedTransform CImage::resolveTransform (const Wallpapers::CScene& scene, const Object& object) {
+     constexpr int kMaxParentDepth = 32;
+ 
+     // Walk up the parent chain leaf-first, bounded by kMaxParentDepth to guard
+     // against cycles. chain[0] is the requested object; the last entry is the root.
+     const Object* chain[kMaxParentDepth + 1];
++    const CObject* renderChain[kMaxParentDepth + 1];
+     int count = 0;
+     const Object* current = &object;
++    renderChain[count] = nullptr;
+     chain[count++] = current;
+ 
+     while (current->parent.has_value ()) {
+@@ -143,11 +153,12 @@ CImage::ResolvedTransform CImage::resolveTransform (const Object& object) const
+ 	    sLog.error ("Parent transform chain is too deep; possible cycle at object id=", current->id);
+ 	    break;
+ 	}
+-	const auto* parentObject = this->getScene ().getObject (current->parent.value ());
++	const auto* parentObject = scene.getObject (current->parent.value ());
+ 	if (parentObject == nullptr) {
+ 	    break;
+ 	}
+ 	current = &parentObject->getObject ();
++	renderChain[count] = parentObject;
+ 	chain[count++] = current;
+     }
+ 
+@@ -156,6 +167,23 @@ CImage::ResolvedTransform CImage::resolveTransform (const Object& object) const
+     ResolvedTransform resolved = localTransform (*chain[count - 1]);
+     for (int i = count - 2; i >= 0; --i) {
+ 	ResolvedTransform local = localTransform (*chain[i]);
++
++	// a child pinned to an attachment point of its parent's puppet lives in that point's space
++	if (!chain[i]->attachment.empty () && renderChain[i + 1] != nullptr) {
++	    glm::mat4 attachment;
++	    const auto* parentImage = dynamic_cast<const CImage*> (renderChain[i + 1]);
++	    if (parentImage != nullptr && parentImage->getAttachmentMatrix (chain[i]->attachment, attachment)) {
++		const glm::vec3 moved = glm::vec3 (attachment * glm::vec4 (local.origin.x, local.origin.y, 0.0f, 1.0f));
++		const glm::vec2 axisX (attachment[0]);
++		const glm::vec2 axisY (attachment[1]);
++		local.origin.x = moved.x;
++		local.origin.y = moved.y;
++		local.angle += std::atan2 (axisX.y, axisX.x);
++		local.scale.x *= glm::length (axisX);
++		local.scale.y *= glm::length (axisY);
++	    }
++	}
++
+ 	const glm::vec2 offset
+ 	    = rotateVec2 ({ local.origin.x * resolved.scale.x, local.origin.y * resolved.scale.y }, resolved.angle);
+ 	local.origin.x = resolved.origin.x + offset.x;
+@@ -167,6 +195,47 @@ CImage::ResolvedTransform CImage::resolveTransform (const Object& object) const
+     return resolved;
+ }
+ 
++bool CImage::ancestorsVisible (const Wallpapers::CScene& scene, const Object& object) {
++    const Object* current = &object;
++    for (int depth = 0; depth < 32 && current->parent.has_value (); depth++) {
++	const auto* parentObject = scene.getObject (current->parent.value ());
++	if (parentObject == nullptr) {
++	    break;
++	}
++	current = &parentObject->getObject ();
++
++	bool visible;
++	if (current->is<Image> ()) {
++	    visible = current->as<Image> ()->visible->value->getBool ();
++	} else if (current->is<Text> ()) {
++	    visible = current->as<Text> ()->visible->value->getBool ();
++	} else if (current->is<Particle> ()) {
++	    visible = current->as<Particle> ()->visible->value->getBool ();
++	} else {
++	    visible = current->groupVisible->value->getBool ();
++	}
++	if (!visible) {
++	    return false;
++	}
++    }
++    return true;
++}
++
++bool CImage::getAttachmentMatrix (const std::string& name, glm::mat4& output) const {
++    for (const auto& attachment : this->m_puppetAttachments) {
++	if (attachment.name != name) {
++	    continue;
++	}
++	if (attachment.bone >= 0 && static_cast<size_t> (attachment.bone) < this->m_puppetBoneWorld.size ()) {
++	    output = this->m_puppetBoneWorld[attachment.bone] * attachment.matrix;
++	} else {
++	    output = attachment.matrix;
++	}
++	return true;
++    }
++    return false;
++}
++
+ CImage::CImage (Wallpapers::CScene& scene, const Image& image) :
+     CObject (scene, image), CRenderable (scene, image, *image.model->material), ScriptableObject (scene, image),
+     m_sceneSpacePosition (GL_NONE), m_copySpacePosition (GL_NONE), m_passSpacePosition (GL_NONE),
+@@ -422,24 +491,624 @@ CImage::~CImage () {
      }
  }
  
@@ -404,7 +769,7 @@ index 470e295..c9f7e67 100644
 + * Reads the model header. Older models use 52-byte vertices (position, bone indices, weights, uv),
 + * newer ones 80-byte vertices with 28 extra bytes after the position.
 + */
-+std::optional<PuppetLayout> parsePuppetLayout (const std::vector<char>& data) {
++std::optional<PuppetLayout> parsePuppetLayout (const std::vector<char>& data, const size_t limit) {
 +    try {
 +	PuppetCursor cursor (data, 9);
 +	cursor.next<int32_t> ();
@@ -414,43 +779,68 @@ index 470e295..c9f7e67 100644
 +	cursor.next<int32_t> ();
 +
 +	uint32_t vertexBytes = cursor.next<uint32_t> ();
-+	bool extended = false;
++	uint32_t format = 0x01800009;
 +
 +	if (vertexBytes == 0) {
-+	    extended = true;
++	    // newer files: padding, then a vertex format word (0x0180xxxx or 0x0181xxxx), then the size
 +	    bool found = false;
 +	    for (int guard = 0; guard < 64 && !found; guard++) {
-+		found = cursor.next<uint32_t> () == 0x0180000F;
++		format = cursor.next<uint32_t> ();
++		found = (format >> 16) == 0x0180 || (format >> 16) == 0x0181;
 +	    }
 +	    if (!found) {
 +		return std::nullopt;
 +	    }
 +	    vertexBytes = cursor.next<uint32_t> ();
-+	} else if (vertexBytes == 0x01800009) {
++	} else if ((vertexBytes >> 16) == 0x0180 || (vertexBytes >> 16) == 0x0181) {
++	    format = vertexBytes;
 +	    vertexBytes = cursor.next<uint32_t> ();
 +	}
 +
-+	const size_t stride = extended ? 80 : 52;
-+	if (vertexBytes == 0 || vertexBytes % stride != 0) {
++	if (vertexBytes == 0) {
 +	    return std::nullopt;
 +	}
 +
 +	const size_t verticesOffset = cursor.offset ();
 +	cursor.skip (vertexBytes);
 +	const uint32_t indexBytes = cursor.next<uint32_t> ();
-+	if (indexBytes == 0 || indexBytes % (sizeof (uint16_t) * 3) != 0) {
++	const size_t indicesOffset = cursor.offset ();
++	if (indexBytes == 0 || indexBytes % (sizeof (uint16_t) * 3) != 0 || indicesOffset + indexBytes > limit) {
 +	    return std::nullopt;
 +	}
-+	cursor.skip (indexBytes);
 +
-+	return PuppetLayout {
-+	    .verticesOffset = verticesOffset,
-+	    .vertexBytes = vertexBytes,
-+	    .stride = stride,
-+	    .indexBytes = indexBytes,
-+	    .weightsOffset = extended ? size_t { 40 } : size_t { 12 },
-+	    .uvOffset = extended ? size_t { 72 } : size_t { 44 },
-+	};
++	uint16_t highest = 0;
++	for (size_t index = 0; index < indexBytes / sizeof (uint16_t); index++) {
++	    uint16_t value;
++	    std::memcpy (&value, data.data () + indicesOffset + index * sizeof (uint16_t), sizeof (value));
++	    highest = std::max (highest, value);
++	}
++
++	// vertex sizes seen in the wild, the one the format word suggests first. Position comes first,
++	// and bone indices, weights and uv are always the last 40 bytes
++	std::vector<size_t> strides;
++	if (format == 0x0180000F) {
++	    strides = { 80, 84, 52, 56 };
++	} else if ((format >> 16) == 0x0181) {
++	    strides = { 84, 80, 56, 52 };
++	} else {
++	    strides = { 52, 56, 80, 84 };
++	}
++
++	for (const size_t stride : strides) {
++	    if (vertexBytes % stride != 0 || highest >= vertexBytes / stride) {
++		continue;
++	    }
++	    return PuppetLayout {
++		.verticesOffset = verticesOffset,
++		.vertexBytes = vertexBytes,
++		.stride = stride,
++		.indexBytes = indexBytes,
++		.weightsOffset = stride - 40,
++		.uvOffset = stride - 8,
++	    };
++	}
++	return std::nullopt;
 +    } catch (const std::exception&) {
 +	return std::nullopt;
 +    }
@@ -629,6 +1019,32 @@ index 470e295..c9f7e67 100644
 +	    }
 +	}
 +
++	// attachment points: a bone, a name and a transform relative to that bone
++	std::vector<PuppetAttachment> attachments;
++	const size_t mdatOffset = findPuppetMarker (data, "MDAT", cursor.offset ());
++	if (mdatOffset + 9 < data.size () && (mdlaOffset >= data.size () || mdatOffset < mdlaOffset)) {
++	    try {
++		PuppetCursor section (data, mdatOffset + 9);
++		section.next<uint32_t> ();
++		const uint16_t attachmentCount = section.next<uint16_t> ();
++		for (uint16_t index = 0; index < attachmentCount; index++) {
++		    PuppetAttachment attachment;
++		    attachment.bone = section.next<uint16_t> ();
++		    attachment.name = section.nextString ();
++		    for (int column = 0; column < 4; column++) {
++			for (int row = 0; row < 4; row++) {
++			    attachment.matrix[column][row] = section.next<float> ();
++			}
++		    }
++		    attachments.push_back (std::move (attachment));
++		}
++	    } catch (const std::exception&) {
++		// keep the ones read so far
++	    }
++	}
++
++	this->m_puppetAttachments = std::move (attachments);
++	this->m_puppetBoneWorld = world;
 +	this->m_puppetWeights = std::move (weights);
 +	this->m_puppetBones = std::move (bones);
 +	this->m_puppetAnimations = std::move (animations);
@@ -646,7 +1062,7 @@ index 470e295..c9f7e67 100644
 +    }
 +}
 +
-+bool CImage::computePuppetPose (const float time, std::vector<GLfloat>& output) const {
++bool CImage::computePuppetPose (const float time, std::vector<GLfloat>& output, const bool keepBones) const {
 +    if (this->m_puppetBones.empty () || this->m_puppetAnimations.empty ()
 +	|| this->getImage ().animationLayers.empty () || this->m_puppetBindPositions.empty ()) {
 +	return false;
@@ -756,6 +1172,9 @@ index 470e295..c9f7e67 100644
 +	    = animated[bone] ? puppetLocalMatrix (position[bone], angles[bone], scale[bone]) : info.local;
 +	skin[bone] = info.parent < 0 ? local : skin[info.parent] * local;
 +    }
++    if (keepBones) {
++	this->m_puppetBoneWorld = skin;
++    }
 +    for (size_t bone = 0; bone < boneCount; bone++) {
 +	skin[bone] = skin[bone] * this->m_puppetBones[bone].inverseBind;
 +    }
@@ -796,7 +1215,7 @@ index 470e295..c9f7e67 100644
 +}
 +
 +void CImage::updatePuppetAnimation () {
-+    if (this->m_hasPuppetMesh && this->computePuppetPose (this->getScene ().getTime (), this->m_puppetRawPositions)) {
++    if (this->m_hasPuppetMesh && this->computePuppetPose (this->getScene ().getTime (), this->m_puppetRawPositions, true)) {
 +	this->updatePuppetPositionBuffer (this->m_size);
 +    }
 +}
@@ -908,19 +1327,27 @@ index 470e295..c9f7e67 100644
  	    sLog.error ("Unsupported puppet model header ", puppetVersion, " in ", *this->getImage ().model->puppet);
  	    return false;
  	}
-@@ -456,16 +1006,37 @@ bool CImage::loadPuppetMesh (const glm::vec2& size) {
+@@ -456,16 +1125,36 @@ bool CImage::loadPuppetMesh (const glm::vec2& size) {
  	auto meshBuffer = std::make_unique<char[]> (data.size ());
  	std::copy (data.begin (), data.end (), meshBuffer.get ());
  	const BinaryReader reader (std::make_shared<MemoryStream> (std::move (meshBuffer), data.size ()));
 -	const auto meshBlock = findPuppetMeshBlock (reader, markerSize, mdlsOffset, meshHeaderSize, vertexStride);
 -	if (!meshBlock.has_value ()) {
 -	    sLog.error ("Could not find a usable MDLV mesh block in ", *this->getImage ().model->puppet);
--	    return false;
 +	size_t vertexBytes = 0;
 +	size_t verticesOffset = 0;
 +	size_t indexBytes = 0;
 +
-+	if (heuristicVersion) {
++	// read the header to find the mesh and its vertex layout; fall back to searching for a
++	// plausible block when the header is not understood
++	if (const auto layout = parsePuppetLayout (data, mdlsOffset); layout.has_value ()) {
++	    vertexStride = layout->stride;
++	    uvOffset = layout->uvOffset;
++	    weightsOffset = layout->weightsOffset;
++	    vertexBytes = layout->vertexBytes;
++	    verticesOffset = layout->verticesOffset;
++	    indexBytes = layout->indexBytes;
++	} else if (heuristicVersion) {
 +	    const auto meshBlock = findPuppetMeshBlock (reader, markerSize, mdlsOffset, meshHeaderSize, vertexStride);
 +	    if (!meshBlock.has_value ()) {
 +		sLog.error ("Could not find a usable MDLV mesh block in ", *this->getImage ().model->puppet);
@@ -930,18 +1357,8 @@ index 470e295..c9f7e67 100644
 +	    verticesOffset = meshBlock->headerOffset + meshHeaderSize;
 +	    indexBytes = meshBlock->indexBytes;
 +	} else {
-+	    // other versions: read the header to find the mesh and its vertex layout
-+	    const auto layout = parsePuppetLayout (data);
-+	    if (!layout.has_value () || layout->verticesOffset + layout->vertexBytes > mdlsOffset) {
-+		sLog.error ("Unsupported puppet model header ", puppetVersion, " in ", *this->getImage ().model->puppet);
-+		return false;
-+	    }
-+	    vertexStride = layout->stride;
-+	    uvOffset = layout->uvOffset;
-+	    weightsOffset = layout->weightsOffset;
-+	    vertexBytes = layout->vertexBytes;
-+	    verticesOffset = layout->verticesOffset;
-+	    indexBytes = layout->indexBytes;
++	    sLog.error ("Unsupported puppet model header ", puppetVersion, " in ", *this->getImage ().model->puppet);
+ 	    return false;
  	}
  
 -	const size_t vertexCount = meshBlock->vertexBytes / vertexStride;
@@ -954,7 +1371,7 @@ index 470e295..c9f7e67 100644
  	std::vector<GLfloat> texcoords;
  	std::vector<GLushort> indices;
  
-@@ -502,6 +1073,13 @@ bool CImage::loadPuppetMesh (const glm::vec2& size) {
+@@ -502,6 +1191,13 @@ bool CImage::loadPuppetMesh (const glm::vec2& size) {
  	    indices.push_back (value);
  	}
  
@@ -968,7 +1385,7 @@ index 470e295..c9f7e67 100644
  	this->updatePuppetPositionBuffer (size);
  
  	glGenBuffers (1, &this->m_puppetTexCoord);
-@@ -518,6 +1096,10 @@ bool CImage::loadPuppetMesh (const glm::vec2& size) {
+@@ -518,6 +1214,10 @@ bool CImage::loadPuppetMesh (const glm::vec2& size) {
  	    " vertices=", vertexCount, " indices=", this->m_puppetIndexCount
  	);
  
@@ -979,7 +1396,7 @@ index 470e295..c9f7e67 100644
  	return true;
      } catch (const std::exception& ex) {
  	sLog.error ("Could not load puppet mesh ", *this->getImage ().model->puppet, ": ", ex.what ());
-@@ -533,9 +1115,10 @@ void CImage::updatePuppetPositionBuffer (const glm::vec2& size) {
+@@ -533,9 +1233,10 @@ void CImage::updatePuppetPositionBuffer (const glm::vec2& size) {
      std::vector<GLfloat> positions;
      positions.reserve (this->m_puppetRawPositions.size ());
      for (size_t index = 0; index + 2 < this->m_puppetRawPositions.size (); index += 3) {
@@ -993,7 +1410,16 @@ index 470e295..c9f7e67 100644
      }
  
      if (this->m_puppetSpacePosition == GL_NONE) {
-@@ -920,6 +1503,8 @@ void CImage::render () {
+@@ -912,7 +1613,7 @@ void CImage::render () {
+ 	return;
+     }
+ 
+-    if (!this->getImage ().visible->value->getBool ()) {
++    if (!this->getImage ().visible->value->getBool () || !ancestorsVisible (this->getScene (), this->getImage ())) {
+ 	return;
+     }
+ 
+@@ -920,6 +1621,8 @@ void CImage::render () {
  
      // Always update screen transform (handles rotation + parallax dynamically)
      this->updateScreenSpacePosition ();
@@ -1002,7 +1428,7 @@ index 470e295..c9f7e67 100644
  
  #if !NDEBUG
      std::string str = "Image ";
-@@ -1086,6 +1671,10 @@ CImage::ResolvedTransform CImage::updateGeometryBuffers () {
+@@ -1086,6 +1789,10 @@ CImage::ResolvedTransform CImage::updateGeometryBuffers () {
  	this->updatePuppetPositionBuffer (size);
      }
  
@@ -1014,12 +1440,44 @@ index 470e295..c9f7e67 100644
      this->uploadGeometryBuffers (size);
      return transform;
 diff --git a/src/WallpaperEngine/Render/Objects/CImage.h b/src/WallpaperEngine/Render/Objects/CImage.h
-index 07eeda2..180b18a 100644
+index 07eeda2..24f420f 100644
 --- a/src/WallpaperEngine/Render/Objects/CImage.h
 +++ b/src/WallpaperEngine/Render/Objects/CImage.h
-@@ -76,7 +76,43 @@ protected:
+@@ -56,7 +56,7 @@ public:
+      */
+     void pinpongFramebuffer (std::shared_ptr<const CFBO>* drawTo, std::shared_ptr<const TextureProvider>* asInput);
+ 
+-protected:
++public:
+     void setupPasses ();
+ 
+     void updateScreenSpacePosition ();
+@@ -75,8 +75,66 @@ protected:
+      */
      [[nodiscard]] static ResolvedTransform localTransform (const WallpaperEngine::Data::Model::Object& object);
  
++    /**
++     * Resolves an object's transform through its parents for any kind of object (images, text, particles),
++     * following puppet attachment points on the way.
++     */
++    [[nodiscard]] static ResolvedTransform resolveTransform (
++	const Wallpapers::CScene& scene, const WallpaperEngine::Data::Model::Object& object
++    );
++
++    /**
++     * Current model-space transform of one of this puppet's attachment points (bone pose included)
++     *
++     * @return false if this image has no attachment with that name
++     */
++    [[nodiscard]] bool getAttachmentMatrix (const std::string& name, glm::mat4& output) const;
++
++    /**
++     * @return false when any parent of the object is hidden: children are not drawn then either
++     */
++    [[nodiscard]] static bool ancestorsVisible (
++	const Wallpapers::CScene& scene, const WallpaperEngine::Data::Model::Object& object
++    );
++
  private:
 +    /** One bone of a puppet model's skeleton */
 +    struct PuppetBone {
@@ -1056,12 +1514,12 @@ index 07eeda2..180b18a 100644
 +	size_t weightsOffset
 +    );
 +    void updatePuppetAnimation ();
-+    [[nodiscard]] bool computePuppetPose (float time, std::vector<GLfloat>& output) const;
++    [[nodiscard]] bool computePuppetPose (float time, std::vector<GLfloat>& output, bool keepBones = false) const;
 +    void choosePuppetOffset (const glm::vec2& size);
      void updatePuppetPositionBuffer (const glm::vec2& size);
      void setupPuppetGeometryCallback (Effects::CPass* pass) const;
      ResolvedTransform updateGeometryBuffers ();
-@@ -103,6 +139,13 @@ private:
+@@ -103,6 +161,21 @@ private:
      GLsizei m_puppetIndexCount = 0;
      bool m_hasPuppetMesh = false;
      std::vector<GLfloat> m_puppetRawPositions = {};
@@ -1070,11 +1528,682 @@ index 07eeda2..180b18a 100644
 +    std::vector<PuppetWeights> m_puppetWeights = {};
 +    std::vector<PuppetBone> m_puppetBones = {};
 +    std::vector<PuppetAnimation> m_puppetAnimations = {};
++    struct PuppetAttachment {
++	std::string name;
++	int bone = -1;
++	glm::mat4 matrix = glm::mat4 (1.0f);
++    };
++    std::vector<PuppetAttachment> m_puppetAttachments = {};
++    /** Bone transforms in model space for the pose drawn last (rest pose until an animation runs) */
++    mutable std::vector<glm::mat4> m_puppetBoneWorld = {};
 +    /** How far the mesh is moved inside its layer so it is not clipped; the layer moves back by the same amount */
 +    glm::vec2 m_puppetOffset = { 0.0f, 0.0f };
  
      glm::mat4 m_modelViewProjectionScreen = {};
      glm::mat4 m_modelViewProjectionPass = {};
+diff --git a/src/WallpaperEngine/Render/Objects/CParticle.cpp b/src/WallpaperEngine/Render/Objects/CParticle.cpp
+index 444752a..e124060 100644
+--- a/src/WallpaperEngine/Render/Objects/CParticle.cpp
++++ b/src/WallpaperEngine/Render/Objects/CParticle.cpp
+@@ -3,6 +3,8 @@
+ #include "WallpaperEngine/Data/Model/Property.h"
+ #include "WallpaperEngine/Logging/Log.h"
+ #include "WallpaperEngine/Maths.h"
++#include "WallpaperEngine/Audio/AudioContext.h"
++#include "WallpaperEngine/Render/Objects/CImage.h"
+ #include "WallpaperEngine/Render/Utils/NoiseUtils.h"
+ 
+ #include <GL/glew.h>
+@@ -110,7 +112,7 @@ void CParticle::setup () {
+     m_lastScreenWidth = getScene ().getCamera ().getWidth ();
+     m_lastScreenHeight = getScene ().getCamera ().getHeight ();
+ 
+-    glm::vec3 origin = m_particle.origin->value->getVec3 ();
++    glm::vec3 origin = CImage::resolveTransform (getScene (), m_particle).origin;
+     origin.x -= m_lastScreenWidth / 2.0f;
+     origin.y = m_lastScreenHeight / 2.0f - origin.y;
+     m_transformedOrigin = origin;
+@@ -170,15 +172,21 @@ void CParticle::setup () {
+ }
+ 
+ void CParticle::render () {
+-    if (!m_initialized || !m_particle.visible->value->getBool ()) {
++    if (!m_initialized || !m_particle.visible->value->getBool () || !CImage::ancestorsVisible (getScene (), m_particle)) {
+ 	return;
+     }
+ 
+     // Initialize time on first render to avoid huge dt spike
+     if (m_time == 0.0) {
+ 	m_time = g_Time;
+-	// Skip update on first frame to avoid weird initial burst
+-	// This ensures all particles start from a clean state
++	// "starttime": the system is shown as if it had already been running for that long
++	if (m_particle.startTime > 0) {
++	    constexpr float step = 1.0f / 30.0f;
++	    const float seconds = std::min (static_cast<float> (m_particle.startTime), 60.0f);
++	    for (float elapsed = 0.0f; elapsed < seconds; elapsed += step) {
++		update (step);
++	    }
++	}
+ 	if (m_useRopeRenderer) {
+ 	    renderRope ();
+ 	} else {
+@@ -213,9 +221,17 @@ void CParticle::update (float dt) {
+     float screenWidth = static_cast<float> (getScene ().getWidth ());
+     float screenHeight = static_cast<float> (getScene ().getHeight ());
+ 
++    if (m_particle.parent.has_value ()) {
++	// follow the parent (and the puppet attachment point it may be pinned to)
++	glm::vec3 origin = CImage::resolveTransform (getScene (), m_particle).origin;
++	origin.x -= screenWidth / 2.0f;
++	origin.y = screenHeight / 2.0f - origin.y;
++	m_transformedOrigin = origin;
++    }
++
+     if (screenWidth != m_lastScreenWidth || screenHeight != m_lastScreenHeight) {
+ 	// Resolution changed - recalculate transformed origin
+-	glm::vec3 origin = m_particle.origin->value->getVec3 ();
++	glm::vec3 origin = CImage::resolveTransform (getScene (), m_particle).origin;
+ 	origin.x -= screenWidth / 2.0f;
+ 	origin.y = screenHeight / 2.0f - origin.y;
+ 	m_transformedOrigin = origin;
+@@ -348,6 +364,27 @@ const glm::vec3& CParticle::getCompositeColor () const { return getColor (); }
+ 
+ // ========== EMITTERS ==========
+ 
++float CParticle::emitterAudioFactor (const ParticleEmitter& emitter) const {
++    if (emitter.audioProcessingMode <= 0) {
++	return 1.0f;
++    }
++
++    // loudness over the emitter's frequency bands, mapped through its bounds
++    const auto& recorder = getScene ().getAudioContext ().getRecorder ();
++    const int first = std::clamp (emitter.audioProcessingFrequencyStart, 0, 15);
++    const int last = std::clamp (emitter.audioProcessingFrequencyEnd, first, 15);
++    float level = 0.0f;
++    for (int band = first; band <= last; band++) {
++	level = std::max (level, recorder.audio16[band]);
++    }
++
++    const float low = emitter.audioProcessingBounds.x;
++    const float high = std::max (emitter.audioProcessingBounds.y, low + 0.0001f);
++    const float amount = std::clamp ((level - low) / (high - low), 0.0f, 1.0f);
++    // sound above the lower bound always produces something, up to the full rate
++    return level > low ? std::max (amount, 0.25f) : 0.0f;
++}
++
+ void CParticle::setupEmitters () {
+     for (const auto& emitter : m_particle.emitters) {
+ 	EmitterFunc func;
+@@ -447,7 +484,7 @@ EmitterFunc CParticle::createBoxEmitter (const ParticleEmitter& emitter) {
+ 
+ 	    // Rate-based emission with optional cap at 1 per frame
+ 	    if (emitter.rate > 0.0f) {
+-		emissionTimer += dt * rate;
++		emissionTimer += dt * rate * this->emitterAudioFactor (emitter);
+ 		uint32_t rateEmit = static_cast<uint32_t> (emissionTimer);
+ 		emissionTimer -= static_cast<float> (rateEmit);
+ 		// limitOnePerFrame (flags bit 1): cap at 1 to prevent rope artifacts
+@@ -548,7 +585,7 @@ EmitterFunc CParticle::createSphereEmitter (const ParticleEmitter& emitter) {
+ 	}
+ 
+ 	// Rate-based emission with optional cap at 1 per frame
+-	emissionTimer += dt * rate;
++	emissionTimer += dt * rate * this->emitterAudioFactor (emitter);
+ 	uint32_t toEmit = static_cast<uint32_t> (emissionTimer);
+ 	emissionTimer -= static_cast<float> (toEmit);
+ 	// limitOnePerFrame (flags bit 1): cap at 1 to prevent rope artifacts
+@@ -1829,6 +1866,18 @@ void CParticle::updateMatrices () {
+     glm::vec3 scale = m_particle.scale->value->getVec3 ();
+     glm::vec3 angles = m_particle.angles->value->getVec3 ();
+ 
++    if (m_particle.parent.has_value ()) {
++	// children take their parents' scale and rotation too
++	const auto resolved = CImage::resolveTransform (getScene (), m_particle);
++	const auto own = CImage::localTransform (m_particle);
++	for (int axis = 0; axis < 3; axis++) {
++	    if (std::abs (own.scale[axis]) > 0.00001f) {
++		scale[axis] *= resolved.scale[axis] / own.scale[axis];
++	    }
++	}
++	angles.z += resolved.angle - own.angle;
++    }
++
+     m_modelMatrix = glm::mat4 (1.0f);
+     m_modelMatrix = glm::translate (m_modelMatrix, m_transformedOrigin);
+     this->applyParallaxToModelMatrix ();
+diff --git a/src/WallpaperEngine/Render/Objects/CParticle.h b/src/WallpaperEngine/Render/Objects/CParticle.h
+index d04194a..984b608 100644
+--- a/src/WallpaperEngine/Render/Objects/CParticle.h
++++ b/src/WallpaperEngine/Render/Objects/CParticle.h
+@@ -131,6 +131,7 @@ protected:
+     void setupOperators ();
+ 
+     // Emitter creators
++    [[nodiscard]] float emitterAudioFactor (const ParticleEmitter& emitter) const;
+     EmitterFunc createBoxEmitter (const ParticleEmitter& emitter);
+     EmitterFunc createSphereEmitter (const ParticleEmitter& emitter);
+ 
+diff --git a/src/WallpaperEngine/Render/Objects/CText.cpp b/src/WallpaperEngine/Render/Objects/CText.cpp
+index 8368634..6371024 100644
+--- a/src/WallpaperEngine/Render/Objects/CText.cpp
++++ b/src/WallpaperEngine/Render/Objects/CText.cpp
+@@ -1,5 +1,6 @@
+ #include "CText.h"
+ 
++#include <algorithm>
+ #include <filesystem>
+ #include <vector>
+ 
+@@ -14,6 +15,7 @@
+ #include "WallpaperEngine/Data/Model/UserSetting.h"
+ #include "WallpaperEngine/Logging/Log.h"
+ #include "WallpaperEngine/Render/Camera.h"
++#include "WallpaperEngine/Render/Objects/CImage.h"
+ #include "WallpaperEngine/Render/Wallpapers/CScene.h"
+ #include "WallpaperEngine/Scripting/ScriptEngine.h"
+ 
+@@ -202,14 +204,10 @@ bool CText::loadSystemFont () {
+ }
+ 
+ unsigned int CText::computeEffectivePixelSize () const {
+-    // WE text objects often come with scale ~0.09 that, combined with a modest
+-    // pointsize, would rasterize glyphs to ~2px on screen (invisible). Rasterize
+-    // at higher resolution so that after the model scale is applied in render()
+-    // the on-screen size matches the intended pointsize.
+-    const glm::vec3 initialScale = m_text.scale->value->getVec3 ();
+-    const float avgScale = (initialScale.x + initialScale.y) * 0.5f;
+-    const float compensate = (avgScale > 0.0f && avgScale < 1.0f) ? std::min (1.0f / avgScale, 32.0f) : 1.0f;
+-    return std::max<unsigned int> (1u, static_cast<unsigned int> (m_text.pointSize->value->getFloat () * compensate));
++    // Wallpaper Engine's text boxes (the "size" field it saves) fit glyphs of about 8/3 pixels per
++    // point: 96 dpi, drawn at twice the size. The object's scale is applied on top when drawing.
++    const float pixels = m_text.pointSize->value->getFloat () * (8.0f / 3.0f);
++    return std::clamp<unsigned int> (static_cast<unsigned int> (pixels), 1u, 1024u);
+ }
+ 
+ void CText::initScriptLayer () {
+@@ -238,45 +236,90 @@ void CText::rebuildTextureFrom (const std::string& text) {
+     // bitmap every time the rendered string changes without leaking.
+     FT_GlyphSlot slot = m_ftFace->glyph;
+ 
+-    int penX = 0;
++    // decode UTF-8 into lines of code points
++    std::vector<std::vector<FT_ULong>> lines (1);
++    for (size_t i = 0; i < text.size ();) {
++	const auto lead = static_cast<unsigned char> (text[i]);
++	FT_ULong code = lead;
++	size_t extra = 0;
++	if (lead >= 0xF0) {
++	    code = lead & 0x07;
++	    extra = 3;
++	} else if (lead >= 0xE0) {
++	    code = lead & 0x0F;
++	    extra = 2;
++	} else if (lead >= 0xC0) {
++	    code = lead & 0x1F;
++	    extra = 1;
++	}
++	i++;
++	for (; extra > 0 && i < text.size (); extra--, i++) {
++	    code = (code << 6) | (static_cast<unsigned char> (text[i]) & 0x3F);
++	}
++	if (code == '\n') {
++	    lines.emplace_back ();
++	} else if (code != '\r') {
++	    lines.back ().push_back (code);
++	}
++    }
++
+     int maxAscent = 0;
+     int maxDescent = 0;
+-
+-    for (unsigned char c : text) {
+-	if (FT_Load_Char (m_ftFace, static_cast<FT_ULong> (c), FT_LOAD_RENDER) != 0) {
+-	    continue;
++    std::vector<int> lineWidths;
++    int width = 1;
++
++    for (const auto& line : lines) {
++	int penX = 0;
++	for (const FT_ULong c : line) {
++	    if (FT_Load_Char (m_ftFace, c, FT_LOAD_RENDER) != 0) {
++		continue;
++	    }
++	    penX += slot->advance.x >> 6;
++	    maxAscent = std::max (maxAscent, slot->bitmap_top);
++	    maxDescent = std::max (maxDescent, static_cast<int> (slot->bitmap.rows) - slot->bitmap_top);
+ 	}
+-	penX += slot->advance.x >> 6;
+-	maxAscent = std::max (maxAscent, slot->bitmap_top);
+-	maxDescent = std::max (maxDescent, static_cast<int> (slot->bitmap.rows) - slot->bitmap_top);
++	lineWidths.push_back (penX);
++	width = std::max (width, penX);
+     }
+ 
+-    const int width = std::max (1, penX);
+-    const int height = std::max (1, maxAscent + maxDescent);
++    const int glyphHeight = std::max (1, maxAscent + maxDescent);
++    const int lineHeight
++	= std::max (glyphHeight, m_ftFace->size != nullptr ? static_cast<int> (m_ftFace->size->metrics.height >> 6) : 0);
++    const int height = glyphHeight + lineHeight * (static_cast<int> (lines.size ()) - 1);
+     std::vector<uint8_t> pixels (static_cast<size_t> (width) * height, 0);
+ 
+-    penX = 0;
+-    for (unsigned char c : text) {
+-	if (FT_Load_Char (m_ftFace, static_cast<FT_ULong> (c), FT_LOAD_RENDER) != 0) {
+-	    continue;
++    for (size_t lineIndex = 0; lineIndex < lines.size (); lineIndex++) {
++	int penX = 0;
++	if (m_text.alignment == "right") {
++	    penX = width - lineWidths[lineIndex];
++	} else if (m_text.alignment != "left") {
++	    penX = (width - lineWidths[lineIndex]) / 2;
+ 	}
++	const int baseline = maxAscent + lineHeight * static_cast<int> (lineIndex);
+ 
+-	const auto& bmp = slot->bitmap;
+-	const int originX = penX + slot->bitmap_left;
+-	const int originY = maxAscent - slot->bitmap_top;
++	for (const FT_ULong c : lines[lineIndex]) {
++	    if (FT_Load_Char (m_ftFace, c, FT_LOAD_RENDER) != 0) {
++		continue;
++	    }
+ 
+-	for (unsigned int row = 0; row < bmp.rows; ++row) {
+-	    for (unsigned int col = 0; col < bmp.width; ++col) {
+-		const int dstX = originX + static_cast<int> (col);
+-		const int dstY = originY + static_cast<int> (row);
+-		if (dstX < 0 || dstX >= width || dstY < 0 || dstY >= height) {
+-		    continue;
++	    const auto& bmp = slot->bitmap;
++	    const int originX = penX + slot->bitmap_left;
++	    const int originY = baseline - slot->bitmap_top;
++
++	    for (unsigned int row = 0; row < bmp.rows; ++row) {
++		for (unsigned int col = 0; col < bmp.width; ++col) {
++		    const int dstX = originX + static_cast<int> (col);
++		    const int dstY = originY + static_cast<int> (row);
++		    if (dstX < 0 || dstX >= width || dstY < 0 || dstY >= height) {
++			continue;
++		    }
++		    auto& pixel = pixels[static_cast<size_t> (dstY) * width + dstX];
++		    pixel = std::max (pixel, bmp.buffer[row * bmp.pitch + col]);
+ 		}
+-		pixels[static_cast<size_t> (dstY) * width + dstX] = bmp.buffer[row * bmp.pitch + col];
+ 	    }
+-	}
+ 
+-	penX += slot->advance.x >> 6;
++	    penX += slot->advance.x >> 6;
++	}
+     }
+ 
+     const bool firstUpload = (m_texture == 0);
+@@ -374,7 +417,7 @@ void CText::render () {
+     if (!m_valid) {
+ 	return;
+     }
+-    if (!m_text.visible->value->getBool ()) {
++    if (!m_text.visible->value->getBool () || !CImage::ancestorsVisible (getScene (), m_text)) {
+ 	return;
+     }
+ 
+@@ -404,25 +447,42 @@ void CText::render () {
+ 
+     const glm::vec4 color = m_text.color->value->getVec4 ();
+     const float alpha = m_text.alpha->value->getFloat ();
+-    const glm::vec3 scale = m_text.scale->value->getVec3 ();
+-    const glm::vec3 origin = m_text.origin->value->getVec3 ();
+-
+-    // WE uses a Y-down coordinate system (origin at top-left, y increases downward).
+-    // The final FBO is presented to screen with vflip=true on Wayland/GLFW, which maps
+-    // GL y- to screen top and GL y+ to screen bottom. This effectively inverts Y again,
+-    // so we need: gl_y = origin.y - scene_h/2  (not the CImage-style scene_h/2 - origin.y).
+-    // CImage pre-compensates for X11 (no vflip) and gets corrected by the Wayland vflip.
+-    // CText renders with direct vflip-aware coordinates.
++    // origin, scale and rotation through the parents, like images
++    const auto resolved = CImage::resolveTransform (getScene (), m_text);
++    const glm::vec3 scale = resolved.scale;
++    const glm::vec3 origin = resolved.origin;
++
++    // same convention as CImage: scene coordinates grow upwards, the framebuffer is flipped on present
+     const float scene_w = getScene ().getCamera ().getWidth ();
+     const float scene_h = getScene ().getCamera ().getHeight ();
+     const glm::vec3 gl_origin = {
+ 	origin.x - scene_w * 0.5f,
+-	origin.y - scene_h * 0.5f,
++	scene_h * 0.5f - origin.y,
+ 	origin.z,
+     };
+ 
++    // place the text inside its box according to the alignment
++    glm::vec2 inner { 0.0f, 0.0f };
++    if (m_text.size.x > 0.0f && m_text.size.y > 0.0f) {
++	const glm::vec2 room = (m_text.size - m_text.padding * 2.0f - m_quadSize) * 0.5f;
++	if (m_text.alignment == "left") {
++	    inner.x = -room.x;
++	} else if (m_text.alignment == "right") {
++	    inner.x = room.x;
++	}
++	if (m_text.verticalalign == "top") {
++	    inner.y = -room.y;
++	} else if (m_text.verticalalign == "bottom") {
++	    inner.y = room.y;
++	}
++    }
++
+     glm::mat4 model = glm::translate (glm::mat4 (1.0f), gl_origin);
++    if (resolved.angle != 0.0f) {
++	model = glm::rotate (model, -resolved.angle, glm::vec3 (0.0f, 0.0f, 1.0f));
++    }
+     model = glm::scale (model, scale);
++    model = glm::translate (model, glm::vec3 (inner, 0.0f));
+ 
+     const glm::mat4 mvp = getScene ().getCamera ().getProjection () * getScene ().getCamera ().getLookAt () * model;
+ 
+diff --git a/src/WallpaperEngine/Render/Objects/Effects/CPass.cpp b/src/WallpaperEngine/Render/Objects/Effects/CPass.cpp
+index e93c293..a66641e 100644
+--- a/src/WallpaperEngine/Render/Objects/Effects/CPass.cpp
++++ b/src/WallpaperEngine/Render/Objects/Effects/CPass.cpp
+@@ -857,11 +857,11 @@ void CPass::setupUniforms () {
+     this->addUniform ("g_LightAmbientColor", sceneData.colors.ambient->value->getVec3 ());
+     this->addUniform ("g_LightSkylightColor", sceneData.colors.skylight->value->getVec3 ());
+     // register variables like brightness and alpha with some default value
+-    this->addUniform ("g_Brightness", renderable.getBrightness ());
+-    this->addUniform ("g_UserAlpha", renderable.getUserAlpha ());
+-    this->addUniform ("g_Alpha", renderable.getAlpha ());
+-    this->addUniform ("g_Color", renderable.getColor ());
+-    this->addUniform ("g_Color4", renderable.getColor4 ());
++    this->addUniform ("g_Brightness", &renderable.getBrightness ());
++    this->addUniform ("g_UserAlpha", &renderable.getUserAlpha ());
++    this->addUniform ("g_Alpha", &renderable.getAlpha ());
++    this->addUniform ("g_Color", &renderable.getColor ());
++    this->addUniform ("g_Color4", &renderable.getColor4 ());
+     if (!this->m_uniforms.contains ("g_CompositeColor")) {
+ 	this->addUniform ("g_CompositeColor", renderable.getCompositeColor ());
+     }
+diff --git a/src/WallpaperEngine/Render/Shaders/GLSLContext.cpp b/src/WallpaperEngine/Render/Shaders/GLSLContext.cpp
+index dd4f4d4..c8a349a 100644
+--- a/src/WallpaperEngine/Render/Shaders/GLSLContext.cpp
++++ b/src/WallpaperEngine/Render/Shaders/GLSLContext.cpp
+@@ -1,4 +1,10 @@
+ #include "GLSLContext.h"
++#include <cstdlib>
++#include <fstream>
++#include <map>
++#include "glslang/MachineIndependent/localintermediate.h"
++#include <regex>
++#include <string>
+ #include "WallpaperEngine/Logging/Log.h"
+ 
+ #include <cassert>
+@@ -131,6 +137,19 @@ GLSLContext& GLSLContext::get () {
+     return *sInstance;
+ }
+ 
++namespace {
++/** Debugging aid: with LWPE_DUMP_SHADERS=<directory> every shader that fails to parse is written there */
++void dumpFailedShader (const char* kind, const std::string& source, const char* log) {
++    const char* directory = std::getenv ("LWPE_DUMP_SHADERS");
++    if (directory == nullptr) {
++	return;
++    }
++    static int counter = 0;
++    std::ofstream out (std::string (directory) + "/failed-" + std::to_string (counter++) + "-" + kind + ".glsl");
++    out << "// " << log << "\n" << source;
++}
++} // namespace
++
+ std::pair<std::string, std::string> GLSLContext::toGlsl (const std::string& vertex, const std::string& fragment) {
+     glslang::TShader vertexShader (EShLangVertex);
+ 
+@@ -145,6 +164,7 @@ std::pair<std::string, std::string> GLSLContext::toGlsl (const std::string& vert
+ 
+     if (!vertexShader.parse (&BuiltInResource, 100, false, EShMsgDefault)) {
+ 	sLog.error ("GLSL vertex unit parsing Failed: ", vertexShader.getInfoLog ());
++	dumpFailedShader ("vertex", vertex, vertexShader.getInfoLog ());
+ 	return { "", "" };
+     }
+     glslang::TShader fragmentShader (EShLangFragment);
+@@ -160,8 +180,30 @@ std::pair<std::string, std::string> GLSLContext::toGlsl (const std::string& vert
+ 
+     if (!fragmentShader.parse (&BuiltInResource, 100, false, EShMsgDefault)) {
+ 	sLog.error ("GLSL fragment unit parsing Failed: ", fragmentShader.getInfoLog ());
++	dumpFailedShader ("fragment", fragment, fragmentShader.getInfoLog ());
+ 	return { "", "" };
+     }
++    // Width of every fragment input as the fragment shader itself declares it. Linking widens an input
++    // to the vertex shader's type when they differ ("varying vec2" against "varying vec4"), while the
++    // code that uses it still expects the narrower one.
++    std::map<std::string, int> declaredInputs;
++    if (const auto* root = fragmentShader.getIntermediate ()->getTreeRoot ();
++	root != nullptr && root->getAsAggregate () != nullptr) {
++	for (const auto* node : root->getAsAggregate ()->getSequence ()) {
++	    const auto* objects = node->getAsAggregate ();
++	    if (objects == nullptr || objects->getOp () != glslang::EOpLinkerObjects) {
++		continue;
++	    }
++	    for (const auto* object : objects->getSequence ()) {
++		const auto* symbol = object->getAsSymbolNode ();
++		if (symbol != nullptr && symbol->getType ().getQualifier ().storage == glslang::EvqVaryingIn
++		    && symbol->getType ().isVector () && !symbol->getType ().isArray ()) {
++		    declaredInputs[std::string (symbol->getName ().c_str ())] = symbol->getType ().getVectorSize ();
++		}
++	    }
++	}
++    }
++
+     glslang::TProgram program;
+     program.addShader (&vertexShader);
+     program.addShader (&fragmentShader);
+@@ -188,8 +230,28 @@ std::pair<std::string, std::string> GLSLContext::toGlsl (const std::string& vert
+     options.es = false;
+     fragmentCompiler.set_common_options (options);
+ 
++    std::string fragmentOutput = fragmentCompiler.compile ();
++
++    // narrow the inputs that linking widened wherever they are used
++    for (const auto& [name, width] : declaredInputs) {
++	std::smatch declaration;
++	const std::regex declared ("\\bin\\s+vec([234])\\s+" + name + "\\s*;");
++	if (!std::regex_search (fragmentOutput, declaration, declared)) {
++	    continue;
++	}
++	const int linkedWidth = declaration[1].str ()[0] - '0';
++	if (linkedWidth <= width || width < 2) {
++	    continue;
++	}
++	const size_t bodyStart = static_cast<size_t> (declaration.position (0) + declaration.length (0));
++	const std::string swizzle = width == 2 ? ".xy" : ".xyz";
++	const std::regex use ("\\b" + name + "\\b");
++	fragmentOutput = fragmentOutput.substr (0, bodyStart)
++	    + std::regex_replace (fragmentOutput.substr (bodyStart), use, name + swizzle);
++    }
++
+     return { vertexCompiler.compile () + "#if 0\n" + vertex + "\n#endif",
+-	     fragmentCompiler.compile () + "#if 0\n" + fragment + "\n#endif" };
++	     fragmentOutput + "#if 0\n" + fragment + "\n#endif" };
+ }
+ 
+ std::unique_ptr<GLSLContext> GLSLContext::sInstance = nullptr;
+\ No newline at end of file
+diff --git a/src/WallpaperEngine/Render/Shaders/ShaderUnit.cpp b/src/WallpaperEngine/Render/Shaders/ShaderUnit.cpp
+index fcc03fc..3ec8598 100644
+--- a/src/WallpaperEngine/Render/Shaders/ShaderUnit.cpp
++++ b/src/WallpaperEngine/Render/Shaders/ShaderUnit.cpp
+@@ -3,6 +3,7 @@
+ #include "WallpaperEngine/Logging/Log.h"
+ #include <exception>
+ #include <regex>
++#include <sstream>
+ #include <stack>
+ #include <string>
+ #include <utility>
+@@ -509,25 +510,40 @@ void ShaderUnit::parseParameterConfiguration (
+ 
+     Variables::ShaderVariable* parameter = nullptr;
+ 
++    // defaults come as "1 0 0" strings, but also as bare numbers (one value for every component)
++    // or with fewer components than the type has
++    const auto defaultVector = [&defvalue] () -> glm::vec4 {
++	glm::vec4 result (0.0f);
++	if (!defvalue.has_value ()) {
++	    return result;
++	}
++	if (defvalue->is_number ()) {
++	    return glm::vec4 (defvalue->get<float> ());
++	}
++	if (defvalue->is_string ()) {
++	    std::istringstream stream (defvalue->get<std::string> ());
++	    float component;
++	    int count = 0;
++	    while (count < 4 && stream >> component) {
++		result[count++] = component;
++	    }
++	    if (count == 1) {
++		result = glm::vec4 (result.x);
++	    }
++	}
++	return result;
++    };
++
+     if (type == "vec4") {
+-	parameter
+-	    = new Variables::ShaderVariableVector4 (VectorBuilder::parse<glm::vec4> (defvalue->get<std::string> ()));
++	parameter = new Variables::ShaderVariableVector4 (defaultVector ());
+     } else if (type == "vec3") {
+-	parameter = new Variables::ShaderVariableVector3 (VectorBuilder::parse<glm::vec3> (*defvalue));
++	parameter = new Variables::ShaderVariableVector3 (glm::vec3 (defaultVector ()));
+     } else if (type == "vec2") {
+-	parameter = new Variables::ShaderVariableVector2 (VectorBuilder::parse<glm::vec2> (*defvalue));
++	parameter = new Variables::ShaderVariableVector2 (glm::vec2 (defaultVector ()));
+     } else if (type == "float") {
+-	if (defvalue->is_string ()) {
+-	    parameter = new Variables::ShaderVariableFloat (std::stoi (defvalue->get<std::string> ()));
+-	} else {
+-	    parameter = new Variables::ShaderVariableFloat (defvalue->get<float> ());
+-	}
++	parameter = new Variables::ShaderVariableFloat (defaultVector ().x);
+     } else if (type == "int") {
+-	if (defvalue->is_string ()) {
+-	    parameter = new Variables::ShaderVariableInteger (std::stoi (defvalue->get<std::string> ()));
+-	} else {
+-	    parameter = new Variables::ShaderVariableInteger (defvalue->get<int> ());
+-	}
++	parameter = new Variables::ShaderVariableInteger (static_cast<int> (defaultVector ().x));
+     } else if (type == "sampler2D" || type == "sampler2DComparison") {
+ 	// samplers can have special requirements, check what sampler we're working with and create definitions
+ 	// if needed
+@@ -645,6 +661,79 @@ void ShaderUnit::linkToUnit (const ShaderUnit* unit) { this->m_link = unit; }
+ 
+ const ShaderUnit* ShaderUnit::getLinkedUnit () const { return this->m_link; }
+ 
++namespace {
++/**
++ * Wallpaper Engine compiles these sources as HLSL on Windows, which accepts things GLSL rejects.
++ * This rewrites the common cases found in Workshop shaders so they parse as GLSL too.
++ */
++std::string relaxShaderSource (std::string source) {
++    // Windows line endings get in the way of the line-based fixes below
++    std::erase (source, '\r');
++
++    // backslash line continuations (multi-line macros) are not part of GLSL 3.30: join the lines
++    for (size_t position = 0; (position = source.find ("\\\n", position)) != std::string::npos;) {
++	source.replace (position, 2, " ");
++    }
++
++    // 1. stray semicolons after preprocessor conditions ("#elif X == 32;")
++    static const std::regex directiveSemicolon (R"((^|\n)([ \t]*#[ \t]*(?:if|elif|ifdef|ifndef|else|endif)\b[^\n;]*);[ \t]*(?=\r?\n))");
++    source = std::regex_replace (source, directiveSemicolon, "$1$2");
++
++    // 2. shaders that bring their own version of a function the header provides as a macro
++    for (const char* name : { "log10", "fmod", "saturate", "atan2", "ddx", "ddy", "lerp", "frac", "mul" }) {
++	const std::regex definition (
++	    std::string (R"((^|\n)([ \t]*(?:float|int|vec[234]|float[234])[ \t]+)") + name + R"([ \t]*\([^;{)]*\)[ \t\r\n]*\{))"
++	);
++	std::smatch match;
++	if (std::regex_search (source, match, definition)) {
++	    source.insert (static_cast<size_t> (match.position (0) + match.length (1)), std::string ("#undef ") + name + "\n");
++	}
++    }
++
++    // 3. M_PI is used by some shaders before (or without) being defined
++    static const std::regex usesPi (R"(\bM_PI\b)");
++    static const std::regex definesPi (R"((^|\n)([ \t]*#[ \t]*define[ \t]+M_PI\b))");
++    if (std::regex_search (source, usesPi)) {
++	source = "#define M_PI 3.14159265358979\n" + std::regex_replace (source, definesPi, "$1#undef M_PI\n$2");
++    }
++
++    // 4. global constants computed from uniforms ("const float A = u_B * 0.5;") become macros
++    static const std::regex globalConst (
++	R"(^([ \t]*)const[ \t]+(?:float|int|vec[234]|float[234])[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*([^;]*\b[ug]_[A-Za-z0-9_]+[^;]*);(.*)$)"
++    );
++    std::string result;
++    result.reserve (source.size ());
++    int depth = 0;
++    size_t start = 0;
++    while (start <= source.size ()) {
++	size_t end = source.find ('\n', start);
++	if (end == std::string::npos) {
++	    end = source.size ();
++	}
++	std::string line = source.substr (start, end - start);
++	std::smatch match;
++	if (depth == 0 && std::regex_match (line, match, globalConst)) {
++	    line = match[1].str () + "#define " + match[2].str () + " (" + match[3].str () + ")" + match[4].str ();
++	}
++	const size_t comment = line.find ("//");
++	for (size_t index = 0; index < line.size () && index < comment; index++) {
++	    if (line[index] == '{') {
++		depth++;
++	    } else if (line[index] == '}' && depth > 0) {
++		depth--;
++	    }
++	}
++	result += line;
++	if (end < source.size ()) {
++	    result += '\n';
++	}
++	start = end + 1;
++    }
++
++    return result;
++}
++} // namespace
++
+ const std::string& ShaderUnit::compile () {
+     if (!this->m_final.empty ()) {
+ 	return this->m_final;
+@@ -715,7 +804,9 @@ const std::string& ShaderUnit::compile () {
+ 
+     // this should be the rest of the shader
+     this->m_final
+-	+= this->applyFragmentTexCoordCompatibility (this->applyLinkedVaryingCompatibility (this->m_preprocessed));
++	+= relaxShaderSource (
++	    this->applyFragmentTexCoordCompatibility (this->applyLinkedVaryingCompatibility (this->m_preprocessed))
++	);
+ 
+     // the pass itself handles shader compilation, the unit doesn't have enough information for this step
+     return this->m_final;
+diff --git a/src/WallpaperEngine/Render/Wallpapers/CScene.cpp b/src/WallpaperEngine/Render/Wallpapers/CScene.cpp
+index ab63d78..2a5a9f4 100644
+--- a/src/WallpaperEngine/Render/Wallpapers/CScene.cpp
++++ b/src/WallpaperEngine/Render/Wallpapers/CScene.cpp
+@@ -1,3 +1,4 @@
++#include "WallpaperEngine/Data/Model/DynamicValue.h"
+ #include "WallpaperEngine/Render/Objects/CImage.h"
+ #include "WallpaperEngine/Render/Objects/CParticle.h"
+ #include "WallpaperEngine/Render/Objects/CSound.h"
+@@ -320,6 +321,9 @@ void CScene::renderFrame (const glm::ivec4& viewport) {
+ 	    = glm::mix (this->m_parallaxDisplacement, (centeredMouse * amount) * influence, delay);
+     }
+ 
++    // move keyframe-animated properties to this frame
++    WallpaperEngine::Data::Model::DynamicValue::tickTimelines (this->getTime ());
++
+     // run a tick in the javascript logic
+     this->getScriptEngine ().tick ();
+ 
 diff --git a/src/WallpaperEngine/Render/Wallpapers/CWeb.cpp b/src/WallpaperEngine/Render/Wallpapers/CWeb.cpp
 index d174953..e22795a 100644
 --- a/src/WallpaperEngine/Render/Wallpapers/CWeb.cpp
